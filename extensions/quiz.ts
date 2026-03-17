@@ -1066,6 +1066,8 @@ async function generateQuizPacket(
 class QuizCardPanel {
 	private container: Container;
 	private showHint = false;
+	private cachedWidth?: number;
+	private cachedLines?: string[];
 
 	constructor(
 		private theme: Theme,
@@ -1144,21 +1146,32 @@ class QuizCardPanel {
 
 	private rebuild(): void {
 		this.container = this.buildContainer();
+		this.cachedWidth = undefined;
+		this.cachedLines = undefined;
 	}
 
 	render(width: number): string[] {
+		if (this.cachedWidth === width && this.cachedLines) {
+			return this.cachedLines;
+		}
+
 		const contentWidth = Math.max(20, width - 4);
 		const borderColor = (s: string) => this.theme.fg("border", s);
 		const innerLines = this.container.render(contentWidth);
 		const padLine = (line: string) => line + " ".repeat(Math.max(0, contentWidth - visibleWidth(line)));
-		return [
+		const rendered = [
 			borderColor(`╭${"─".repeat(Math.max(0, contentWidth + 2))}╮`),
 			...innerLines.map((line) => `${borderColor("│")} ${padLine(line)} ${borderColor("│")}`),
 			borderColor(`╰${"─".repeat(Math.max(0, contentWidth + 2))}╯`),
 		];
+		this.cachedWidth = width;
+		this.cachedLines = rendered;
+		return rendered;
 	}
 
 	invalidate(): void {
+		this.cachedWidth = undefined;
+		this.cachedLines = undefined;
 		this.container.invalidate();
 	}
 
