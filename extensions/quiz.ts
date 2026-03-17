@@ -10,10 +10,10 @@ import { Container, Markdown, matchesKey, Text } from "@mariozechner/pi-tui";
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { extname, join, relative, resolve } from "node:path";
+import { basename, extname, join, relative, resolve } from "node:path";
 
 type ScopeKind = "workset" | "session" | "repo" | "file";
-type SourceKind = "conversation" | "file" | "readme" | "tree";
+type SourceKind = "conversation" | "file" | "readme" | "manifest" | "tree";
 type Lens = "abstraction" | "usage" | "mechanism" | "assumption" | "change" | "debugging";
 type Depth = "foundational" | "intermediate" | "subtle" | "transfer";
 
@@ -27,6 +27,16 @@ type SessionBranchEntry = {
 		details?: unknown;
 	};
 };
+
+interface FileActivity {
+	absPath: string;
+	relPath: string;
+	score: number;
+	readCount: number;
+	modifiedCount: number;
+	mentionCount: number;
+	lastSeenDistance: number;
+}
 
 interface ResolvedScope {
 	kind: ScopeKind;
@@ -134,6 +144,42 @@ const CODE_FILE_EXTENSIONS = new Set([
 	".hs",
 	".sql",
 ]);
+
+const MANIFEST_FILE_NAMES = new Set([
+	"package.json",
+	"pyproject.toml",
+	"project.toml",
+	"cargo.toml",
+	"go.mod",
+	"requirements.txt",
+	"setup.py",
+	"setup.cfg",
+	"environment.yml",
+	"environment.yaml",
+	"pom.xml",
+	"build.gradle",
+	"build.gradle.kts",
+	"cmakelists.txt",
+	"makefile",
+]);
+
+const ROOT_MANIFEST_PRIORITY = [
+	"package.json",
+	"pyproject.toml",
+	"Project.toml",
+	"Cargo.toml",
+	"go.mod",
+	"requirements.txt",
+	"setup.py",
+	"setup.cfg",
+	"environment.yml",
+	"environment.yaml",
+	"pom.xml",
+	"build.gradle",
+	"build.gradle.kts",
+	"CMakeLists.txt",
+	"Makefile",
+];
 
 const SYSTEM_PROMPT = `You are an active code-reading tutor that creates short, high-value quizzes.
 
@@ -374,37 +420,179 @@ function buildRecentConversationText(branch: SessionBranchEntry[]): string {
 	return sections.join("\n\n");
 }
 
-function trackedFilesFromDetails(details: unknown): string[] {
-	if (!details || typeof details !== "object") return [];
+function detailsFileLists(details: unknown): { readFiles: string[]; modifiedFiles: string[] } {
+	if (!details || typeof details !== "object") return { readFiles: [], modifiedFiles: [] };
 	const candidate = details as { readFiles?: unknown; modifiedFiles?: unknown };
-	const values = [candidate.modifiedFiles, candidate.readFiles].flatMap((value) => (Array.isArray(value) ? value : []));
-	return values.filter((value): value is string => typeof value === "string");
+	return {
+		readFiles: Array.isArray(candidate.readFiles)
+			? candidate.readFiles.filter((value): value is string => typeof value === "string")
+			: [],
+		modifiedFiles: Array.isArray(candidate.modifiedFiles)
+			? candidate.modifiedFiles.filter((value): value is string => typeof value === "string")
+			: [],
+	};
 }
 
-function collectRecentTrackedFiles(branch: SessionBranchEntry[], cwd: string, limit = MAX_TRACKED_FILES): string[] {
-	const seen = new Set<string>();
-	const files: string[] = [];
+function isManifestLikePath(path: string): boolean {
+	return MANIFEST_FILE_NAMES.has(basename(path).toLowerCase());
+}
 
-	for (let i = branch.length - 1; i >= 0 && files.length < limit; i--) {
+function isInterestingQuizFilePath(path: string): boolean {
+	const lower = path.toLowerCase();
+	return isLikelyCodeFile(path) || isManifestLikePath(path) || lower === "readme" || lower === "readme.md";
+}
+
+function resolveExistingFilePath(token: string, cwd: string, repoRoot: string): string | undefined {
+	const cleaned = token.replace(/^[\s"'`(\[]+|[\s"'`),:;\]]+$/g, "");
+	if (!cleaned) return undefined;
+	const candidates = [resolve(cwd, cleaned), resolve(repoRoot, cleaned)];
+	for (const candidate of candidates) {
+		if (!existsSync(candidate)) continue;
+		try {
+			if (statSync(candidate).isFile()) return candidate;
+		} catch {
+			// Ignore unreadable files.
+		}
+	}
+	return undefined;
+}
+
+function extractPathMentions(text: string, cwd: string, repoRoot: string): string[] {
+	const matches = new Set<string>();
+	const regex = /(?:^|[\s"'`(\[])([A-Za-z0-9_./-]+(?:\.[A-Za-z0-9_.-]+)+)(?=$|[\s"'`),:;\]])/g;
+	let match: RegExpExecArray | null;
+	while ((match = regex.exec(text)) !== null) {
+		const token = match[1];
+		const lowerBase = basename(token).toLowerCase();
+		if (!(token.includes("/") || CODE_FILE_EXTENSIONS.has(extname(token).toLowerCase()) || MANIFEST_FILE_NAMES.has(lowerBase))) {
+			continue;
+		}
+		const resolvedPath = resolveExistingFilePath(token, cwd, repoRoot);
+		if (resolvedPath) matches.add(resolvedPath);
+	}
+	return [...matches];
+}
+
+function collectFileActivity(branch: SessionBranchEntry[], cwd: string, repoRoot: string): FileActivity[] {
+	const activity = new Map<string, FileActivity>();
+
+	const addActivity = (
+		absPath: string,
+		{
+			scoreDelta,
+			readDelta = 0,
+			modifiedDelta = 0,
+			mentionDelta = 0,
+			distance,
+		}: { scoreDelta: number; readDelta?: number; modifiedDelta?: number; mentionDelta?: number; distance: number },
+	) => {
+		if (!existsSync(absPath)) return;
+		try {
+			if (!statSync(absPath).isFile()) return;
+		} catch {
+			return;
+		}
+		const relPath = displayPath(relative(repoRoot, absPath));
+		const entry = activity.get(absPath) ?? {
+			absPath,
+			relPath,
+			score: 0,
+			readCount: 0,
+			modifiedCount: 0,
+			mentionCount: 0,
+			lastSeenDistance: distance,
+		};
+		entry.score += scoreDelta;
+		entry.readCount += readDelta;
+		entry.modifiedCount += modifiedDelta;
+		entry.mentionCount += mentionDelta;
+		entry.lastSeenDistance = Math.min(entry.lastSeenDistance, distance);
+		activity.set(absPath, entry);
+	};
+
+	for (let i = branch.length - 1, distance = 0; i >= 0; i--, distance++) {
 		const entry = branch[i];
+		const recencyBoost = Math.max(0, 12 - distance);
+
 		for (const details of [entry.details, entry.message?.details]) {
-			for (const file of trackedFilesFromDetails(details)) {
-				const absPath = resolve(cwd, file);
-				if (seen.has(absPath)) continue;
-				seen.add(absPath);
-				if (!existsSync(absPath)) continue;
-				try {
-					if (!statSync(absPath).isFile()) continue;
-					files.push(absPath);
-					if (files.length >= limit) return files;
-				} catch {
-					// Ignore unreadable files.
-				}
+			const { readFiles, modifiedFiles } = detailsFileLists(details);
+			for (const file of modifiedFiles) {
+				addActivity(resolve(cwd, file), { scoreDelta: 20 + recencyBoost * 2, modifiedDelta: 1, distance });
 			}
+			for (const file of readFiles) {
+				addActivity(resolve(cwd, file), { scoreDelta: 10 + recencyBoost, readDelta: 1, distance });
+			}
+		}
+
+		const text = extractTextParts(entry.message?.content).join("\n");
+		for (const mentionedPath of extractPathMentions(text, cwd, repoRoot)) {
+			addActivity(mentionedPath, { scoreDelta: 6 + recencyBoost, mentionDelta: 1, distance });
 		}
 	}
 
-	return files;
+	return [...activity.values()].sort(
+		(a, b) =>
+			b.score - a.score ||
+			a.lastSeenDistance - b.lastSeenDistance ||
+			b.modifiedCount - a.modifiedCount ||
+			b.readCount - a.readCount ||
+			a.relPath.localeCompare(b.relPath),
+	);
+}
+
+function pushUniquePath(target: string[], candidate: string | undefined, limit: number): void {
+	if (!candidate || target.includes(candidate)) return;
+	target.push(candidate);
+	if (target.length > limit) target.length = limit;
+}
+
+function listWorkingTreeFiles(repoRoot: string): string[] {
+	try {
+		const output = execSync("git status --porcelain --untracked-files=normal", {
+			cwd: repoRoot,
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		return output
+			.split("\n")
+			.map((line) => line.trimEnd())
+			.filter(Boolean)
+			.map((line) => {
+				const payload = line.slice(3).trim();
+				const path = payload.includes(" -> ") ? payload.split(" -> ").pop() || payload : payload;
+				return resolve(repoRoot, path);
+			})
+			.filter((absPath) => existsSync(absPath));
+	} catch {
+		return [];
+	}
+}
+
+function selectSessionFiles(activity: FileActivity[], limit = MAX_TRACKED_FILES): string[] {
+	const selected: string[] = [];
+	for (const item of activity) {
+		if (!isInterestingQuizFilePath(item.relPath)) continue;
+		pushUniquePath(selected, item.absPath, limit);
+		if (selected.length >= limit) break;
+	}
+	return selected;
+}
+
+function selectWorksetFiles(repoRoot: string, activity: FileActivity[], limit = MAX_TRACKED_FILES): string[] {
+	const selected = selectSessionFiles(activity, limit);
+	for (const absPath of listWorkingTreeFiles(repoRoot)) {
+		const relPath = displayPath(relative(repoRoot, absPath));
+		if (!isInterestingQuizFilePath(relPath)) continue;
+		pushUniquePath(selected, absPath, limit);
+		if (selected.length >= limit) break;
+	}
+	if (selected.length < limit) {
+		for (const relPath of representativeRepoFiles(repoRoot, activity.map((item) => item.absPath), limit * 2)) {
+			pushUniquePath(selected, join(repoRoot, relPath), limit);
+			if (selected.length >= limit) break;
+		}
+	}
+	return selected;
 }
 
 function getRepoRoot(cwd: string): string {
@@ -469,7 +657,7 @@ function filePreview(absPath: string, repoRoot: string, maxLines = MAX_FILE_LINE
 			: buildHeadPreviewContent(raw, maxLines, truncated);
 		return {
 			id: "",
-			kind: relPath.toLowerCase().startsWith("readme") ? "readme" : "file",
+			kind: relPath.toLowerCase().startsWith("readme") ? "readme" : isManifestLikePath(relPath) ? "manifest" : "file",
 			title: relPath,
 			content,
 			fingerprint: hashText(content),
@@ -483,6 +671,14 @@ function filePreview(absPath: string, repoRoot: string, maxLines = MAX_FILE_LINE
 
 function findReadme(repoRoot: string): string | undefined {
 	for (const name of ["README.md", "README", "readme.md", "readme"]) {
+		const absPath = join(repoRoot, name);
+		if (existsSync(absPath)) return absPath;
+	}
+	return undefined;
+}
+
+function findRootManifest(repoRoot: string): string | undefined {
+	for (const name of ROOT_MANIFEST_PRIORITY) {
 		const absPath = join(repoRoot, name);
 		if (existsSync(absPath)) return absPath;
 	}
@@ -508,11 +704,30 @@ function representativeRepoFiles(repoRoot: string, recentFiles: string[], limit 
 			if (file.startsWith("lib/")) score += 8;
 			if (file.startsWith("app/")) score += 8;
 			if (file.includes("index")) score += 2;
+			if (file.includes("main")) score += 2;
+			if (file.includes("core")) score += 2;
 			if (file.includes("test") || file.includes("spec")) score -= 10;
 			return { file, score };
 		})
 		.sort((a, b) => b.score - a.score || a.file.length - b.file.length || a.file.localeCompare(b.file));
 	return scored.slice(0, limit).map((item) => item.file);
+}
+
+function selectRepoFiles(repoRoot: string, activity: FileActivity[], limit = MAX_TRACKED_FILES + 1): string[] {
+	const selected: string[] = [];
+	pushUniquePath(selected, findRootManifest(repoRoot), limit);
+	for (const item of activity) {
+		if (!isLikelyCodeFile(item.relPath)) continue;
+		pushUniquePath(selected, item.absPath, limit);
+		if (selected.length >= limit) break;
+	}
+	if (selected.length < limit) {
+		for (const relPath of representativeRepoFiles(repoRoot, activity.map((item) => item.absPath), limit * 2)) {
+			pushUniquePath(selected, join(repoRoot, relPath), limit);
+			if (selected.length >= limit) break;
+		}
+	}
+	return selected;
 }
 
 function addSource(sources: SourceItem[], source: Omit<SourceItem, "id">): void {
@@ -522,7 +737,7 @@ function addSource(sources: SourceItem[], source: Omit<SourceItem, "id">): void 
 function gatherSources(scope: ResolvedScope, ctx: ExtensionCommandContext, cwd: string, repoRoot: string): SourceItem[] {
 	const branch = ctx.sessionManager.getBranch() as SessionBranchEntry[];
 	const recentConversation = buildRecentConversationText(branch);
-	const recentFiles = collectRecentTrackedFiles(branch, cwd);
+	const fileActivity = collectFileActivity(branch, cwd, repoRoot);
 	const sources: SourceItem[] = [];
 
 	if (recentConversation) {
@@ -542,7 +757,8 @@ function gatherSources(scope: ResolvedScope, ctx: ExtensionCommandContext, cwd: 
 	}
 
 	if (scope.kind === "workset" || scope.kind === "session") {
-		for (const file of recentFiles.slice(0, MAX_TRACKED_FILES)) {
+		const selectedFiles = scope.kind === "workset" ? selectWorksetFiles(repoRoot, fileActivity) : selectSessionFiles(fileActivity);
+		for (const file of selectedFiles) {
 			const source = filePreview(file, repoRoot);
 			if (source) addSource(sources, source);
 		}
@@ -567,9 +783,8 @@ function gatherSources(scope: ResolvedScope, ctx: ExtensionCommandContext, cwd: 
 			});
 		}
 
-		for (const relPath of representativeRepoFiles(repoRoot, recentFiles)) {
-			const absPath = join(repoRoot, relPath);
-			const source = filePreview(absPath, repoRoot);
+		for (const file of selectRepoFiles(repoRoot, fileActivity)) {
+			const source = filePreview(file, repoRoot);
 			if (source) addSource(sources, source);
 		}
 	}
@@ -652,7 +867,7 @@ function buildQuizPrompt(scope: ResolvedScope, sources: SourceItem[]): string {
 		"- 1 subtle assumption / change impact / failure mode question",
 		"",
 		"Each card should be answerable from the provided sources and should help the user build a durable mental model.",
-		"If file or readme sources are available, prefer snippet-backed cards and include real snippets for at least 2 cards when helpful.",
+		"If file, manifest, or readme sources are available, prefer snippet-backed cards and include real snippets for at least 2 cards when helpful.",
 		"When writing snippet.code from numbered sources, strip the leading line-number prefixes like '  12 | ' and return only the actual code text.",
 		"",
 		"Return JSON of the form:",

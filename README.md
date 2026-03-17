@@ -57,20 +57,28 @@ The intended audience is someone who wants a **scientist / engineer / applied-ma
 ### `workset`
 Current best-effort “what I’m actively touching” scope.
 
-Currently this means:
+Currently this means a weighted mix of:
 - recent conversation context
-- recently read / modified files if available in session metadata
+- files recently read / modified in the session
+- files explicitly mentioned in recent conversation, when they resolve to real paths
+- current working-tree changes as a fallback
+- representative repo files when the session is sparse
 
 ### `session`
 Quiz the current session’s recent ideas and touched code.
+
+This is narrower than `workset`: it prefers files with strong session evidence rather than falling back to broader repo context.
 
 ### `repo`
 Best-effort architecture / codebase orientation.
 
 Currently uses:
+- recent conversation context
 - README if present
+- a root manifest/config file if present (e.g. `package.json`, `pyproject.toml`, `Project.toml`)
 - repo tree summary
-- recent files from the session, or representative code files as fallback
+- activity-weighted code files from the current session
+- representative central code files as fallback
 
 ### `file <path>`
 Quiz a specific file directly.
@@ -95,9 +103,9 @@ A later phase can add a small reusable question bank keyed by scope + source fin
 - [x] hidden session persistence
 
 ### Phase 1
-- [ ] better workset resolution from session history
-- [ ] better repo file selection
-- [ ] stronger snippet extraction for large files
+- [x] better workset resolution from session history
+- [x] better repo file selection
+- [x] stronger snippet extraction for large files
 - [ ] reuse latest generated packet
 
 ### Phase 2
