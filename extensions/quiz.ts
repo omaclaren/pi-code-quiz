@@ -1,6 +1,5 @@
 import { completeSimple, type ThinkingLevel } from "@mariozechner/pi-ai";
-import { getMarkdownTheme, type ExtensionAPI, type ExtensionCommandContext, type Theme } from "@mariozechner/pi-coding-agent";
-import { Container, Key, Markdown, matchesKey, Text, type OverlayHandle, visibleWidth } from "@mariozechner/pi-tui";
+import { type ExtensionAPI, type ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 import { jsonrepair } from "jsonrepair";
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -121,8 +120,6 @@ interface GlimpseQuizLaunchResult {
 	error?: string;
 }
 
-type QuestionStageAction = "answer" | "reveal" | "skip" | "quit";
-type RevealStageAction = "next" | "quit";
 type QuizThinkingLevel = "off" | ThinkingLevel;
 
 interface ParsedQuizCommandArgs {
@@ -131,7 +128,6 @@ interface ParsedQuizCommandArgs {
 	error?: string;
 }
 
-let activeQuizOverlayHandle: OverlayHandle | null = null;
 let activeQuizClose: (() => void) | null = null;
 
 let glimpseModulePromise: Promise<any> | null = null;
@@ -147,20 +143,6 @@ const CODE_PREVIEW_BLOCK_LINES = 18;
 const CODE_PREVIEW_TAIL_LINES = 24;
 const CODE_PREVIEW_MAX_BLOCKS = 4;
 const SEGMENT_MERGE_GAP = 2;
-const QUIZ_OVERLAY_OPTIONS = {
-	anchor: "top-right" as const,
-	width: "44%" as const,
-	minWidth: 48,
-	maxHeight: "78%" as const,
-	margin: { top: 1, right: 1 },
-	nonCapturing: true,
-};
-const QUIZ_LOADER_OVERLAY_OPTIONS = {
-	anchor: "top-center" as const,
-	width: 68,
-	maxHeight: 7,
-	margin: { top: 1 },
-};
 
 const LENS_VALUES = new Set<Lens>(["abstraction", "usage", "mechanism", "assumption", "change", "debugging"]);
 const DEPTH_VALUES = new Set<Depth>(["foundational", "intermediate", "subtle", "transfer"]);
@@ -227,7 +209,7 @@ const SYSTEM_PROMPT = `You are an active code-reading tutor that creates short, 
 
 Audience and intent:
 - The user is often more scientist / applied mathematician / engineer than conventional software developer.
-- They want a tactile, operational feel for code: core abstractions, how to use them, what assumptions matter, what changes under perturbation, and where the conceptual seams are.
+- They want a tactile, operational feel for code: what is being represented, how it is used, how values move through the code, what assumptions matter, what changes under perturbation, and where the conceptual seams are.
 - They do NOT want generic software-process trivia unless it is truly central.
 
 Your job:
@@ -235,12 +217,22 @@ Your job:
 - Ask questions that probe real understanding and push the user toward better mental models.
 - Use real source snippets as evidence when possible, but only in service of a question.
 - Prefer questions about abstraction, usage/interface, mechanism/flow, assumptions/invariants, change impact, and debugging/failure modes.
-- Include a mix of foundational and subtle questions.
+- Phrase questions in plain, direct language, like a thoughtful supervisor checking whether someone really understands the code.
+
+Style requirements for questions:
+- Prefer one clear conceptual probe per card.
+- If a second clause is included, it should directly support the same idea rather than introduce a separate mini-question.
+- Prefer concrete wording over abstract CS jargon.
+- If you need to ask about an invariant or assumption, restate it in plain language.
+- Use the actual names from the code when they clarify meaning; do not replace a named quantity with vague phrases like "the second variable".
+- Favor operational prompts such as "how is this split?", "what comes back out?", "what decides X vs Y?", or "what would change if...".
 
 Avoid:
 - trivia about tests, CI, file layout, naming conventions, tooling, or line-number memory
 - shallow \"what is the function name\" prompts
 - questions that can be answered without reasoning about the provided sources
+- awkwardly formal wording like \"What invariant must hold between A and B?\" when a clearer plain-language version is possible
+- double-barrelled prompts that combine two distinct ideas into one question
 
 Output requirements:
 - Return STRICT JSON only.
@@ -951,6 +943,13 @@ function buildQuizPrompt(scope: ResolvedScope, sources: SourceItem[]): string {
 		"At most 1 card should be subtle or transfer.",
 		"Avoid opening with a gotcha, hidden-assumption, or failure-mode question unless the user explicitly asked for a hard challenge.",
 		"Each card should be answerable from the provided sources and should help the user build a durable mental model.",
+		"Keep questions direct and natural. One card should usually target one main idea.",
+		"Prefer plain-language probes over formal wording. If you ask about an invariant, state it concretely in terms of what must stay the same or what round-trip should work.",
+		"Use actual names from the code when they clarify meaning. For example, prefer 'temperature or concentration' over 'the second variable' when the code makes that explicit.",
+		"Bad question style: 'What invariant must hold between stack_state and unstack_state?'",
+		"Better question style: 'If you stack a state and then unstack it, what should come back unchanged, and how can you see that from the slicing?'",
+		"Bad question style: 'How does this code decide which half is pressure and which half is the second variable?'",
+		"Better question style: 'When rebuilding a PTState or PCState from solver vector x, how does the code split the vector, and where does it decide whether the second block means temperature or concentration?'",
 		"If file, manifest, or readme sources are available, prefer snippet-backed cards and include real snippets for at least 2 cards when helpful.",
 		"When writing snippet.code from numbered sources, strip the leading line-number prefixes like '  12 | ' and return only the actual code text.",
 		"",
@@ -1605,7 +1604,7 @@ button:hover { border-color: var(--accent); }
     <div class="header">
       <div>
         <div class="title">Code Quiz</div>
-        <div class="meta">Question ${index}/${packet.cards.length} · ${escapeHtml(card.lens)} · ${escapeHtml(card.depth)}</div>
+        <div class="meta">Question ${index}/${packet.cards.length}</div>
       </div>
       <div class="meta">${escapeHtml(packet.scope.label)}</div>
     </div>
@@ -1861,400 +1860,6 @@ async function runGlimpseQuizFlow(
 	});
 }
 
-abstract class CachedOverlayPanel {
-	private _focused = false;
-	protected cachedWidth?: number;
-	protected cachedLines?: string[];
-
-	get focused(): boolean {
-		return this._focused;
-	}
-
-	set focused(value: boolean) {
-		if (this._focused === value) return;
-		this._focused = value;
-		this.cachedWidth = undefined;
-		this.cachedLines = undefined;
-	}
-}
-
-class QuizCardPanel extends CachedOverlayPanel {
-	private container: Container;
-	private showHint = false;
-
-	constructor(
-		private theme: Theme,
-		private scopeLabel: string,
-		private card: QuizCard,
-		private index: number,
-		private total: number,
-		private phase: "question" | "reveal",
-		private done: (value: { action: QuestionStageAction | RevealStageAction; viewedHint?: boolean }) => void,
-		private userAnswer?: string,
-	) {
-		super();
-		this.container = this.buildContainer();
-	}
-
-	private titleText(): string {
-		const badge = this.focused ? this.theme.fg("success", "● focused") : this.theme.fg("warning", "○ passive");
-		return `${this.theme.fg("accent", this.theme.bold("CODE QUIZ"))} ${badge}`;
-	}
-
-	private metaText(): string {
-		return this.theme.fg("muted", `Q${this.index}/${this.total} · ${this.card.lens} · ${this.card.depth} · ${this.scopeLabel}`);
-	}
-
-	private footerText(): string {
-		if (!this.focused) {
-			return this.theme.fg("dim", "Main editor stays active · Ctrl+Alt+Q or /quiz-focus to interact with quiz");
-		}
-		if (this.phase === "question") {
-			return this.theme.fg(
-				"dim",
-				this.card.hint
-					? "a answer · h hint · r reveal · s skip · q quit · Ctrl+Alt+Q return to editor"
-					: "a answer · r reveal · s skip · q quit · Ctrl+Alt+Q return to editor",
-			);
-		}
-		return this.theme.fg("dim", "n next · q quit · Ctrl+Alt+Q return to editor");
-	}
-
-	private renderMarkdown(): string {
-		const sections: string[] = [];
-		const snippet = this.card.snippet;
-		if (snippet?.code) {
-			const labelParts = [snippet.title, snippet.path].filter(Boolean);
-			const lineRange =
-				typeof snippet.startLine === "number" && typeof snippet.endLine === "number"
-					? ` lines ${snippet.startLine}-${snippet.endLine}`
-					: "";
-			const label = labelParts.length > 0 ? `**Evidence:** ${labelParts.join(" · ")}${lineRange}` : "**Evidence**";
-			const lang = snippet.language || languageFromPath(snippet.path) || "text";
-			sections.push(`${label}\n\n` + "```" + `${lang}\n${snippet.code}\n` + "```");
-		}
-
-		sections.push(`### Question\n\n${this.card.question}`);
-
-		if (this.phase === "question" && this.showHint && this.card.hint) {
-			sections.push(`### Hint\n\n${this.card.hint}`);
-		}
-
-		if (this.phase === "reveal") {
-			sections.push(`### Your answer\n\n${this.userAnswer ? this.userAnswer : "_No answer recorded._"}`);
-			sections.push(`### Ideal answer\n\n${this.card.idealAnswer}`);
-			if (this.card.whyMatters) sections.push(`### Why this matters\n\n${this.card.whyMatters}`);
-			if (this.card.misconception) sections.push(`### Common trap\n\n${this.card.misconception}`);
-		}
-
-		return sections.join("\n\n");
-	}
-
-	private buildContainer(): Container {
-		const container = new Container();
-		container.addChild(new Text(this.titleText(), 1, 0));
-		container.addChild(new Text(this.metaText(), 1, 0));
-		container.addChild(new Markdown(this.renderMarkdown(), 1, 1, getMarkdownTheme()));
-		container.addChild(new Text(this.footerText(), 1, 0));
-		return container;
-	}
-
-	private rebuild(): void {
-		this.container = this.buildContainer();
-		this.cachedWidth = undefined;
-		this.cachedLines = undefined;
-	}
-
-	render(width: number): string[] {
-		if (this.cachedWidth === width && this.cachedLines) {
-			return this.cachedLines;
-		}
-
-		const contentWidth = Math.max(20, width - 4);
-		const borderPalette = this.focused ? "accent" : "warning";
-		const topLeft = this.focused ? "╔" : "┏";
-		const topRight = this.focused ? "╗" : "┓";
-		const bottomLeft = this.focused ? "╚" : "┗";
-		const bottomRight = this.focused ? "╝" : "┛";
-		const horizontal = this.focused ? "═" : "━";
-		const vertical = this.focused ? "║" : "┃";
-		const borderColor = (s: string) => this.theme.fg(borderPalette, s);
-		const innerLines = this.container.render(contentWidth);
-		const padLine = (line: string) => line + " ".repeat(Math.max(0, contentWidth - visibleWidth(line)));
-		const rendered = [
-			borderColor(`${topLeft}${horizontal.repeat(Math.max(0, contentWidth + 2))}${topRight}`),
-			...innerLines.map((line) => `${borderColor(vertical)} ${padLine(line)} ${borderColor(vertical)}`),
-			borderColor(`${bottomLeft}${horizontal.repeat(Math.max(0, contentWidth + 2))}${bottomRight}`),
-		];
-		this.cachedWidth = width;
-		this.cachedLines = rendered;
-		return rendered;
-	}
-
-	invalidate(): void {
-		this.cachedWidth = undefined;
-		this.cachedLines = undefined;
-		this.container.invalidate();
-	}
-
-	handleInput(data: string): void {
-		const lower = data.length === 1 ? data.toLowerCase() : undefined;
-		if (this.phase === "question") {
-			if (lower === "h" && this.card.hint) {
-				this.showHint = !this.showHint;
-				this.rebuild();
-				return;
-			}
-			if (lower === "a") return this.done({ action: "answer", viewedHint: this.showHint });
-			if (lower === "r") return this.done({ action: "reveal", viewedHint: this.showHint });
-			if (lower === "s") return this.done({ action: "skip", viewedHint: this.showHint });
-			if (lower === "q" || matchesKey(data, "escape")) return this.done({ action: "quit", viewedHint: this.showHint });
-			return;
-		}
-
-		if (lower === "n" || matchesKey(data, "enter")) return this.done({ action: "next" });
-		if (lower === "q" || matchesKey(data, "escape")) return this.done({ action: "quit" });
-	}
-}
-
-class QuizLoadingPanel extends CachedOverlayPanel {
-	private container: Container;
-
-	constructor(
-		private theme: Theme,
-		private message: string,
-		private onCancel: () => void,
-	) {
-		super();
-		this.container = this.buildContainer();
-	}
-
-	private titleText(): string {
-		const badge = this.focused ? this.theme.fg("success", "● focused") : this.theme.fg("warning", "○ passive");
-		return `${this.theme.fg("accent", this.theme.bold("CODE QUIZ"))} ${badge}`;
-	}
-
-	private footerText(): string {
-		if (!this.focused) {
-			return this.theme.fg("dim", "Generating in background · Ctrl+Alt+Q to focus · /quiz-close cancels");
-		}
-		return this.theme.fg("dim", "q or Esc cancel · Ctrl+Alt+Q return to editor");
-	}
-
-	private buildContainer(): Container {
-		const container = new Container();
-		container.addChild(new Text(this.titleText(), 1, 0));
-		container.addChild(new Text(this.theme.fg("muted", "Preparing questions from current scope..."), 1, 0));
-		container.addChild(new Text(this.message, 1, 1));
-		container.addChild(new Text(this.footerText(), 1, 0));
-		return container;
-	}
-
-	private rebuild(): void {
-		this.container = this.buildContainer();
-		this.cachedWidth = undefined;
-		this.cachedLines = undefined;
-	}
-
-	render(width: number): string[] {
-		if (this.cachedWidth === width && this.cachedLines) {
-			return this.cachedLines;
-		}
-
-		const contentWidth = Math.max(20, width - 4);
-		const borderPalette = this.focused ? "accent" : "warning";
-		const borderColor = (s: string) => this.theme.fg(borderPalette, s);
-		const innerLines = this.container.render(contentWidth);
-		const padLine = (line: string) => line + " ".repeat(Math.max(0, contentWidth - visibleWidth(line)));
-		const rendered = [
-			borderColor(`┏${"━".repeat(Math.max(0, contentWidth + 2))}┓`),
-			...innerLines.map((line) => `${borderColor("┃")} ${padLine(line)} ${borderColor("┃")}`),
-			borderColor(`┗${"━".repeat(Math.max(0, contentWidth + 2))}┛`),
-		];
-		this.cachedWidth = width;
-		this.cachedLines = rendered;
-		return rendered;
-	}
-
-	invalidate(): void {
-		this.cachedWidth = undefined;
-		this.cachedLines = undefined;
-		this.container.invalidate();
-	}
-
-	handleInput(data: string): void {
-		const lower = data.length === 1 ? data.toLowerCase() : undefined;
-		if (lower === "q" || matchesKey(data, "escape")) {
-			this.onCancel();
-		}
-	}
-}
-
-async function showQuestionStage(
-	ctx: ExtensionCommandContext,
-	packet: QuizPacket,
-	card: QuizCard,
-	index: number,
-): Promise<{ action: QuestionStageAction; viewedHint: boolean }> {
-	let handleRef: OverlayHandle | null = null;
-	try {
-		ctx.ui.setStatus("code-quiz", "Code Quiz open · Ctrl+Alt+Q to focus/unfocus overlay");
-		return await ctx.ui.custom<{ action: QuestionStageAction; viewedHint: boolean }>(
-			(_, theme, __, done) => {
-				activeQuizClose = () => done({ action: "quit", viewedHint: false });
-				return new QuizCardPanel(
-					theme,
-					packet.scope.label,
-					card,
-					index,
-					packet.cards.length,
-					"question",
-					(result) => done({ action: result.action as QuestionStageAction, viewedHint: Boolean(result.viewedHint) }),
-				);
-			},
-			{
-				overlay: true,
-				overlayOptions: QUIZ_OVERLAY_OPTIONS,
-				onHandle: (handle) => {
-					handleRef = handle;
-					activeQuizOverlayHandle = handle;
-				},
-			},
-		);
-	} finally {
-		if (activeQuizOverlayHandle === handleRef) activeQuizOverlayHandle = null;
-		activeQuizClose = null;
-		ctx.ui.setStatus("code-quiz", undefined);
-	}
-}
-
-async function showRevealStage(
-	ctx: ExtensionCommandContext,
-	packet: QuizPacket,
-	card: QuizCard,
-	index: number,
-	userAnswer?: string,
-): Promise<{ action: RevealStageAction }> {
-	let handleRef: OverlayHandle | null = null;
-	try {
-		ctx.ui.setStatus("code-quiz", "Code Quiz open · Ctrl+Alt+Q to focus/unfocus overlay");
-		return await ctx.ui.custom<{ action: RevealStageAction }>(
-			(_, theme, __, done) => {
-				activeQuizClose = () => done({ action: "quit" });
-				return new QuizCardPanel(
-					theme,
-					packet.scope.label,
-					card,
-					index,
-					packet.cards.length,
-					"reveal",
-					(result) => done({ action: result.action as RevealStageAction }),
-					userAnswer,
-				);
-			},
-			{
-				overlay: true,
-				overlayOptions: QUIZ_OVERLAY_OPTIONS,
-				onHandle: (handle) => {
-					handleRef = handle;
-					activeQuizOverlayHandle = handle;
-				},
-			},
-		);
-	} finally {
-		if (activeQuizOverlayHandle === handleRef) activeQuizOverlayHandle = null;
-		activeQuizClose = null;
-		ctx.ui.setStatus("code-quiz", undefined);
-	}
-}
-
-async function runQuiz(packet: QuizPacket, ctx: ExtensionCommandContext): Promise<QuizRunRecord> {
-	const answers: QuizRunAnswer[] = [];
-	let quitEarly = false;
-
-	for (let i = 0; i < packet.cards.length; i++) {
-		const card = packet.cards[i];
-		const questionResult = await showQuestionStage(ctx, packet, card, i + 1);
-		if (questionResult.action === "quit") {
-			quitEarly = true;
-			break;
-		}
-		if (questionResult.action === "skip") {
-			answers.push({ cardId: card.id, skipped: true, viewedHint: questionResult.viewedHint });
-			continue;
-		}
-
-		let answer: string | undefined;
-		if (questionResult.action === "answer") {
-			const raw = await ctx.ui.editor(`Answer ${i + 1}/${packet.cards.length}`, "");
-			answer = safeString(raw);
-		}
-
-		answers.push({ cardId: card.id, answer, viewedHint: questionResult.viewedHint });
-		const revealResult = await showRevealStage(ctx, packet, card, i + 1, answer);
-		if (revealResult.action === "quit") {
-			quitEarly = true;
-			break;
-		}
-	}
-
-	return {
-		completedAt: new Date().toISOString(),
-		quitEarly,
-		answers,
-		packet,
-	};
-}
-
-async function generatePacketWithOverlay(
-	pi: ExtensionAPI,
-	ctx: ExtensionCommandContext,
-	scope: ResolvedScope,
-	sources: SourceItem[],
-	thinkingLevel?: QuizThinkingLevel,
-): Promise<{ packet?: QuizPacket; error?: string }> {
-	const effectiveThinkingLevel = thinkingLevel ?? pi.getThinkingLevel();
-	let generationError: string | undefined;
-	let handleRef: OverlayHandle | null = null;
-	const generationAbort = new AbortController();
-	const packet = await ctx.ui.custom<QuizPacket | null>(
-		(_tui, theme, _kb, done) => {
-			const thinkingLabel = ctx.model?.reasoning ? ` · thinking ${effectiveThinkingLevel}` : "";
-			activeQuizClose = () => {
-				generationAbort.abort();
-				done(null);
-			};
-
-			generateQuizPacket(pi, ctx, scope, sources, generationAbort.signal, thinkingLevel)
-				.then(done)
-				.catch((err) => {
-					generationError = err instanceof Error ? err.message : String(err);
-					done(null);
-				});
-
-			return new QuizLoadingPanel(
-				theme,
-				`Generating quiz with ${ctx.model?.id || "current model"}${thinkingLabel} for ${scope.label}...`,
-				() => {
-					generationAbort.abort();
-					done(null);
-				},
-			);
-		},
-		{
-			overlay: true,
-			overlayOptions: QUIZ_LOADER_OVERLAY_OPTIONS,
-			onHandle: (handle) => {
-				handleRef = handle;
-				activeQuizOverlayHandle = handle;
-			},
-		},
-	);
-	if (activeQuizOverlayHandle === handleRef) activeQuizOverlayHandle = null;
-	activeQuizClose = null;
-	return packet ? { packet } : { error: generationError || "Quiz generation cancelled" };
-}
-
 async function handleGlimpseQuizCommand(
 	pi: ExtensionAPI,
 	args: string,
@@ -2310,50 +1915,8 @@ async function handleGlimpseQuizCommand(
 }
 
 export default function activeCodeTutor(pi: ExtensionAPI) {
-	pi.registerShortcut(Key.ctrlAlt("q"), {
-		description: "Focus or unfocus the legacy TUI quiz overlay if one is open",
-		handler: async (ctx) => {
-			if (!activeQuizOverlayHandle) {
-				if (activeQuizClose) {
-					ctx.ui.notify("A native Glimpse quiz is open; focus that window directly", "info");
-				} else {
-					ctx.ui.notify("No code quiz overlay is open", "info");
-				}
-				return;
-			}
-			if (activeQuizOverlayHandle.isFocused()) {
-				activeQuizOverlayHandle.unfocus();
-				ctx.ui.notify("Code quiz unfocused", "info");
-			} else {
-				activeQuizOverlayHandle.focus();
-				ctx.ui.notify("Code quiz focused", "info");
-			}
-		},
-	});
-
-	pi.registerCommand("quiz-focus", {
-		description: "Focus or unfocus the legacy TUI quiz overlay if one is open",
-		handler: async (_args, ctx) => {
-			if (!activeQuizOverlayHandle) {
-				if (activeQuizClose) {
-					ctx.ui.notify("A native Glimpse quiz is open; focus that window directly", "info");
-				} else {
-					ctx.ui.notify("No code quiz overlay is open", "info");
-				}
-				return;
-			}
-			if (activeQuizOverlayHandle.isFocused()) {
-				activeQuizOverlayHandle.unfocus();
-				ctx.ui.notify("Code quiz unfocused", "info");
-			} else {
-				activeQuizOverlayHandle.focus();
-				ctx.ui.notify("Code quiz focused", "info");
-			}
-		},
-	});
-
 	pi.registerCommand("quiz-close", {
-		description: "Close the active quiz window or overlay",
+		description: "Close the active quiz window",
 		handler: async (_args, ctx) => {
 			if (!activeQuizClose) {
 				ctx.ui.notify("No code quiz is open", "info");

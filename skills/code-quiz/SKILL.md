@@ -35,6 +35,7 @@ The tutor should prefer questions that probe:
 - what assumptions or invariants matter
 - what would change if some parameter / branch / interface changed
 - how one would detect likely failure modes
+- in plain, direct language rather than formal or overly clever wording
 
 Avoid trivia like:
 - tests

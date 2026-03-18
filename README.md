@@ -14,12 +14,13 @@ The goal is not to generate polished summaries. The goal is to force **active en
 This package currently focuses on a small, low-overhead workflow:
 
 - one main command: `/quiz`
-- `/quiz` opens a native **Glimpse** window by default
+- `/quiz` opens a native **Glimpse** window
 - `/quiz-glimpse` is kept as an alias
 - scope is central: `workset`, `session`, `repo`, `file <path>`
 - uses the **active model** and **active thinking level** for quiz generation
 - stores generated quiz packets as **hidden session entries**
 - starts the Glimpse window immediately, then fills in the quiz once generation completes
+- aims for plain-language, direct questions rather than clever/formal wording
 - shows real snippets as evidence, but only in service of a question
 
 It is **not** trying to be an Anki clone or a full spaced-repetition framework yet.
@@ -38,13 +39,6 @@ It is **not** trying to be an Anki clone or a full spaced-repetition framework y
 /quiz-glimpse                     # alias for /quiz
 /quiz-glimpse repo --thinking off
 /quiz-close                       # close the active quiz window
-/quiz-focus                       # legacy TUI overlay control, mostly not needed now
-```
-
-Shortcut:
-
-```text
-Ctrl+Alt+Q            # legacy TUI overlay focus toggle, mostly not needed now
 ```
 
 ## Question style
@@ -56,6 +50,7 @@ The generator is explicitly biased toward:
 - mechanism / flow
 - subtle assumptions / invariants
 - change impact / failure modes
+- plain-language, operational questions rather than clever or formal ones
 
 But the **default ramp is intentionally gentle**:
 
