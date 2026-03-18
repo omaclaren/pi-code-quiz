@@ -282,6 +282,7 @@ const USAGE = [
 
 const QUIZ_THINKING_LEVELS: QuizThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 const DEFAULT_QUIZ_AUDIENCE: QuizAudience = "general";
+const QUIZ_GENERATION_MAX_ATTEMPTS = 2;
 const QUIZ_AUDIENCE_ALIASES: Record<string, QuizAudience> = {
 	general: "general",
 	gen: "general",
@@ -1318,33 +1319,61 @@ async function generateQuizPacket(
 ): Promise<QuizPacket> {
 	if (!ctx.model) throw new Error("No active model selected");
 	const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
-	const prompt = buildQuizPrompt(scope, sources, audience, previousCards);
+	const basePrompt = buildQuizPrompt(scope, sources, audience, previousCards);
 	const reasoning = ctx.model.reasoning ? toReasoning(thinkingOverride ?? pi.getThinkingLevel()) : undefined;
+	let lastError: Error | undefined;
 
-	const response = await completeSimple(
-		ctx.model,
-		{
-			systemPrompt: SYSTEM_PROMPT,
-			messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }],
-		},
-		{
-			apiKey,
-			reasoning,
-			maxTokens: 4000,
-			signal,
-		},
-	);
+	for (let attempt = 1; attempt <= QUIZ_GENERATION_MAX_ATTEMPTS; attempt++) {
+		const prompt =
+			attempt === 1
+				? basePrompt
+				: [
+						basePrompt,
+						"The previous attempt returned malformed JSON.",
+						"Regenerate the full payload from scratch.",
+						"Before answering, ensure the JSON is complete, syntactically valid, and contains all closing brackets and quotes.",
+						"Return JSON only.",
+				  ].join("\n\n");
 
-	const responseText = response.content
-		.filter((part): part is { type: "text"; text: string } => part.type === "text")
-		.map((part) => part.text)
-		.join("\n");
+		const response = await completeSimple(
+			ctx.model,
+			{
+				systemPrompt: SYSTEM_PROMPT,
+				messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }],
+			},
+			{
+				apiKey,
+				reasoning,
+				maxTokens: 5000,
+				signal,
+			},
+		);
 
-	const { data, repaired } = parseJsonPayloadText(responseText, "quiz");
-	if (repaired && ctx.hasUI) {
-		ctx.ui.notify("Quiz JSON was malformed; repaired automatically", "info");
+		const responseText = response.content
+			.filter((part): part is { type: "text"; text: string } => part.type === "text")
+			.map((part) => part.text)
+			.join("\n");
+
+		try {
+			const { data, repaired } = parseJsonPayloadText(responseText, "quiz");
+			if (repaired && ctx.hasUI) {
+				ctx.ui.notify("Quiz JSON was malformed; repaired automatically", "info");
+			}
+			if (attempt > 1 && ctx.hasUI) {
+				ctx.ui.notify("Retried quiz generation after malformed JSON", "info");
+			}
+			return normalizePacket(data, scope, sources, audience);
+		} catch (error) {
+			lastError = error instanceof Error ? error : new Error(String(error));
+			if (signal.aborted) throw lastError;
+			if (attempt < QUIZ_GENERATION_MAX_ATTEMPTS && ctx.hasUI) {
+				ctx.ui.notify("Quiz JSON was malformed; retrying once", "info");
+				continue;
+			}
+		}
 	}
-	return normalizePacket(data, scope, sources, audience);
+
+	throw lastError || new Error("Quiz generation failed");
 }
 
 const ANSWER_FEEDBACK_SYSTEM_PROMPT = `You are a concise, supportive code tutor.
