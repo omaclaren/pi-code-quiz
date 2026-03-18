@@ -25,14 +25,16 @@ It is **not** trying to be an Anki clone or a full spaced-repetition framework y
 ## Commands
 
 ```text
-/quiz                 # default: current workset
+/quiz                             # default: current workset
 /quiz workset
 /quiz session
 /quiz repo
 /quiz file src/foo.ts
-/quiz src/foo.ts      # shorthand for file scope when path exists
-/quiz-focus           # focus/unfocus the quiz overlay
-/quiz-close           # close the quiz overlay
+/quiz src/foo.ts                  # shorthand for file scope when path exists
+/quiz repo --thinking off         # faster / less reasoning
+/quiz file src/foo.ts --thinking low
+/quiz-focus                       # focus/unfocus the quiz overlay
+/quiz-close                       # close the quiz overlay
 ```
 
 Shortcut:

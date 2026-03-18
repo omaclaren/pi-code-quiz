@@ -7,6 +7,7 @@ import {
 	type Theme,
 } from "@mariozechner/pi-coding-agent";
 import { Container, Key, Markdown, matchesKey, Text, type OverlayHandle, visibleWidth } from "@mariozechner/pi-tui";
+import { jsonrepair } from "jsonrepair";
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
@@ -107,6 +108,13 @@ interface QuizRunRecord {
 
 type QuestionStageAction = "answer" | "reveal" | "skip" | "quit";
 type RevealStageAction = "next" | "quit";
+type QuizThinkingLevel = "off" | ThinkingLevel;
+
+interface ParsedQuizCommandArgs {
+	scope?: ResolvedScope;
+	thinkingLevel?: QuizThinkingLevel;
+	error?: string;
+}
 
 let activeQuizOverlayHandle: OverlayHandle | null = null;
 let activeQuizClose: (() => void) | null = null;
@@ -231,13 +239,17 @@ const USAGE = [
 	"/quiz repo",
 	"/quiz file <path>",
 	"/quiz <path-to-file>",
+	"/quiz repo --thinking off",
+	"/quiz file src/foo.ts --thinking low",
 ].join("\n");
+
+const QUIZ_THINKING_LEVELS: QuizThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 
 function hashText(text: string): string {
 	return createHash("sha256").update(text).digest("hex").slice(0, 16);
 }
 
-function toReasoning(level: ReturnType<ExtensionAPI["getThinkingLevel"]>): ThinkingLevel | undefined {
+function toReasoning(level: QuizThinkingLevel): ThinkingLevel | undefined {
 	return level === "off" ? undefined : level;
 }
 
@@ -809,6 +821,40 @@ function gatherSources(scope: ResolvedScope, ctx: ExtensionCommandContext, cwd: 
 	return sources;
 }
 
+function isQuizThinkingLevel(value: string): value is QuizThinkingLevel {
+	return QUIZ_THINKING_LEVELS.includes(value as QuizThinkingLevel);
+}
+
+function parseQuizCommandArgs(args: string, cwd: string, repoRoot: string): ParsedQuizCommandArgs {
+	let remaining = args.trim();
+	let thinkingLevel: QuizThinkingLevel | undefined;
+
+	const explicitMatch = /(?:^|\s)--thinking\s+(off|minimal|low|medium|high|xhigh)(?=\s|$)/i.exec(remaining);
+	if (explicitMatch) {
+		thinkingLevel = explicitMatch[1]!.toLowerCase() as QuizThinkingLevel;
+		remaining = `${remaining.slice(0, explicitMatch.index)} ${remaining.slice(explicitMatch.index + explicitMatch[0].length)}`.trim();
+	} else {
+		const malformedThinking = /(?:^|\s)--thinking(?:\s+(\S+))?/i.exec(remaining);
+		if (malformedThinking) {
+			const attempted = malformedThinking[1] || "<missing>";
+			return {
+				error: `Invalid thinking level: ${attempted}. Use one of: ${QUIZ_THINKING_LEVELS.join(", ")}\n\nUsage:\n${USAGE}`,
+			};
+		}
+	}
+
+	if (!thinkingLevel) {
+		const leadingThinking = /^(off|minimal|low|medium|high|xhigh)(?=\s|$)/i.exec(remaining);
+		if (leadingThinking) {
+			thinkingLevel = leadingThinking[1]!.toLowerCase() as QuizThinkingLevel;
+			remaining = remaining.slice(leadingThinking[0].length).trim();
+		}
+	}
+
+	const parsedScope = parseScopeArgs(remaining, cwd, repoRoot);
+	return { ...parsedScope, thinkingLevel };
+}
+
 function parseScopeArgs(args: string, cwd: string, repoRoot: string): { scope?: ResolvedScope; error?: string } {
 	const trimmed = args.trim();
 	if (!trimmed) return { scope: { kind: "workset", label: "Current workset" } };
@@ -941,8 +987,23 @@ function extractJsonPayload(text: string): string {
 	throw new Error("Model did not return JSON");
 }
 
+function parseQuizPayloadText(text: string): { data: unknown; repaired: boolean } {
+	const payload = extractJsonPayload(text);
+	try {
+		return { data: JSON.parse(payload), repaired: false };
+	} catch (parseError) {
+		try {
+			return { data: JSON.parse(jsonrepair(payload)), repaired: true };
+		} catch (repairError) {
+			const parseMessage = parseError instanceof Error ? parseError.message : String(parseError);
+			const repairMessage = repairError instanceof Error ? repairError.message : String(repairError);
+			throw new Error(`Failed to parse quiz JSON (${parseMessage}; repair failed: ${repairMessage})`);
+		}
+	}
+}
+
 function fallbackSnippet(source?: SourceItem): QuizCardSnippet | undefined {
-	if (!source || (source.kind !== "file" && source.kind !== "readme")) return undefined;
+	if (!source || (source.kind !== "file" && source.kind !== "readme" && source.kind !== "manifest")) return undefined;
 	const code = stripLineNumberPrefixes(source.content.split("\n").slice(0, 12).join("\n"));
 	return {
 		sourceId: source.id,
@@ -1050,11 +1111,12 @@ async function generateQuizPacket(
 	scope: ResolvedScope,
 	sources: SourceItem[],
 	signal: AbortSignal,
+	thinkingOverride?: QuizThinkingLevel,
 ): Promise<QuizPacket> {
 	if (!ctx.model) throw new Error("No active model selected");
 	const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
 	const prompt = buildQuizPrompt(scope, sources);
-	const reasoning = ctx.model.reasoning ? toReasoning(pi.getThinkingLevel()) : undefined;
+	const reasoning = ctx.model.reasoning ? toReasoning(thinkingOverride ?? pi.getThinkingLevel()) : undefined;
 
 	const response = await completeSimple(
 		ctx.model,
@@ -1075,8 +1137,11 @@ async function generateQuizPacket(
 		.map((part) => part.text)
 		.join("\n");
 
-	const payload = JSON.parse(extractJsonPayload(responseText));
-	return normalizePacket(payload, scope, sources);
+	const { data, repaired } = parseQuizPayloadText(responseText);
+	if (repaired && ctx.hasUI) {
+		ctx.ui.notify("Quiz JSON was malformed; repaired automatically", "info");
+	}
+	return normalizePacket(data, scope, sources);
 }
 
 class QuizCardPanel {
@@ -1406,7 +1471,7 @@ export default function activeCodeTutor(pi: ExtensionAPI) {
 
 			const cwd = process.cwd();
 			const repoRoot = getRepoRoot(cwd);
-			const { scope, error } = parseScopeArgs(args || "", cwd, repoRoot);
+			const { scope, thinkingLevel, error } = parseQuizCommandArgs(args || "", cwd, repoRoot);
 			if (!scope) {
 				ctx.ui.notify(error || "Failed to resolve quiz scope", "error");
 				return;
@@ -1418,13 +1483,19 @@ export default function activeCodeTutor(pi: ExtensionAPI) {
 				return;
 			}
 
+			const effectiveThinkingLevel = thinkingLevel ?? pi.getThinkingLevel();
 			let generationError: string | undefined;
 			const packet = await ctx.ui.custom<QuizPacket | null>(
 				(tui, theme, _kb, done) => {
-					const loader = new BorderedLoader(tui, theme, `Generating quiz with ${ctx.model!.id} for ${scope.label}...`);
+					const thinkingLabel = ctx.model!.reasoning ? ` · thinking ${effectiveThinkingLevel}` : "";
+					const loader = new BorderedLoader(
+						tui,
+						theme,
+						`Generating quiz with ${ctx.model!.id}${thinkingLabel} for ${scope.label}...`,
+					);
 					loader.onAbort = () => done(null);
 
-					generateQuizPacket(pi, ctx, scope, sources, loader.signal)
+					generateQuizPacket(pi, ctx, scope, sources, loader.signal, thinkingLevel)
 						.then(done)
 						.catch((err) => {
 							generationError = err instanceof Error ? err.message : String(err);

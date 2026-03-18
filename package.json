@@ -32,5 +32,8 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "jsonrepair": "^3.13.3"
   }
 }
