@@ -51,6 +51,12 @@ The generator is explicitly biased toward:
 - subtle assumptions / invariants
 - change impact / failure modes
 
+But the **default ramp is intentionally gentle**:
+
+- start with basic orientation / usage questions
+- then move toward mechanism / flow
+- only later include a subtle or change-impact question when warranted
+
 It explicitly avoids generic dev-process trivia such as tests, CI, file layout, naming conventions, or tooling unless they are central to the abstraction being learned.
 
 The intended audience is someone who wants a **scientist / engineer / applied-maths** style understanding:

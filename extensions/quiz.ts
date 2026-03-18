@@ -877,12 +877,16 @@ function buildQuizPrompt(scope: ResolvedScope, sources: SourceItem[]): string {
 		scopeGuidance,
 		"",
 		`Create ${CARD_COUNT} quiz cards.`,
-		"Use a balanced mix. Aim for something like:",
-		"- 1 abstraction / big-picture question",
-		"- 1 usage / interface / contract question",
-		"- 1 mechanism / flow question",
-		"- 1 subtle assumption / change impact / failure mode question",
+		"Default stance: the user is still orienting to the code and needs a gentle ramp, not an oral exam or a trap-heavy critique.",
+		"Use a balanced mix, but skew basic by default. Aim for something like:",
+		"- Card 1: foundational abstraction or concrete usage question",
+		"- Card 2: foundational or intermediate mechanism / interface question",
+		"- Card 3: intermediate mechanism / assumption / flow question",
+		"- Card 4: optional subtle or change-impact question only if clearly warranted",
 		"",
+		"At least 2 cards should be foundational or intermediate.",
+		"At most 1 card should be subtle or transfer.",
+		"Avoid opening with a gotcha, hidden-assumption, or failure-mode question unless the user explicitly asked for a hard challenge.",
 		"Each card should be answerable from the provided sources and should help the user build a durable mental model.",
 		"If file, manifest, or readme sources are available, prefer snippet-backed cards and include real snippets for at least 2 cards when helpful.",
 		"When writing snippet.code from numbered sources, strip the leading line-number prefixes like '  12 | ' and return only the actual code text.",
@@ -1006,6 +1010,14 @@ function normalizePacket(raw: unknown, scope: ResolvedScope, sources: SourceItem
 
 	if (cards.length === 0) throw new Error("Model returned no usable quiz cards");
 
+	const depthRank: Record<Depth, number> = {
+		foundational: 0,
+		intermediate: 1,
+		subtle: 2,
+		transfer: 3,
+	};
+	cards.sort((a, b) => depthRank[a.depth] - depthRank[b.depth]);
+
 	return {
 		version: 1,
 		scope: {
@@ -1068,6 +1080,16 @@ async function generateQuizPacket(
 }
 
 class QuizCardPanel {
+	private _focused = false;
+	get focused(): boolean {
+		return this._focused;
+	}
+	set focused(value: boolean) {
+		if (this._focused === value) return;
+		this._focused = value;
+		this.cachedWidth = undefined;
+		this.cachedLines = undefined;
+	}
 	private container: Container;
 	private showHint = false;
 	private cachedWidth?: number;
@@ -1087,26 +1109,27 @@ class QuizCardPanel {
 	}
 
 	private titleText(): string {
-		return this.theme.fg(
-			"accent",
-			this.theme.bold(`Quiz ${this.index}/${this.total} · ${this.card.lens} · ${this.card.depth}`),
-		);
+		const badge = this.focused ? this.theme.fg("success", "● focused") : this.theme.fg("warning", "○ passive");
+		return `${this.theme.fg("accent", this.theme.bold("CODE QUIZ"))} ${badge}`;
 	}
 
 	private metaText(): string {
-		return this.theme.fg("muted", `Scope: ${this.scopeLabel}`);
+		return this.theme.fg("muted", `Q${this.index}/${this.total} · ${this.card.lens} · ${this.card.depth} · ${this.scopeLabel}`);
 	}
 
 	private footerText(): string {
+		if (!this.focused) {
+			return this.theme.fg("dim", "Main editor stays active · Ctrl+Alt+Q or /quiz-focus to interact with quiz");
+		}
 		if (this.phase === "question") {
 			return this.theme.fg(
 				"dim",
 				this.card.hint
-					? "Ctrl+Alt+Q focus/unfocus · when focused: a answer · h hint · r reveal · s skip · q quit"
-					: "Ctrl+Alt+Q focus/unfocus · when focused: a answer · r reveal · s skip · q quit",
+					? "a answer · h hint · r reveal · s skip · q quit · Ctrl+Alt+Q return to editor"
+					: "a answer · r reveal · s skip · q quit · Ctrl+Alt+Q return to editor",
 			);
 		}
-		return this.theme.fg("dim", "Ctrl+Alt+Q focus/unfocus · when focused: n next · q quit");
+		return this.theme.fg("dim", "n next · q quit · Ctrl+Alt+Q return to editor");
 	}
 
 	private renderMarkdown(): string {
@@ -1160,13 +1183,20 @@ class QuizCardPanel {
 		}
 
 		const contentWidth = Math.max(20, width - 4);
-		const borderColor = (s: string) => this.theme.fg("border", s);
+		const borderPalette = this.focused ? "accent" : "warning";
+		const topLeft = this.focused ? "╔" : "┏";
+		const topRight = this.focused ? "╗" : "┓";
+		const bottomLeft = this.focused ? "╚" : "┗";
+		const bottomRight = this.focused ? "╝" : "┛";
+		const horizontal = this.focused ? "═" : "━";
+		const vertical = this.focused ? "║" : "┃";
+		const borderColor = (s: string) => this.theme.fg(borderPalette, s);
 		const innerLines = this.container.render(contentWidth);
 		const padLine = (line: string) => line + " ".repeat(Math.max(0, contentWidth - visibleWidth(line)));
 		const rendered = [
-			borderColor(`╭${"─".repeat(Math.max(0, contentWidth + 2))}╮`),
-			...innerLines.map((line) => `${borderColor("│")} ${padLine(line)} ${borderColor("│")}`),
-			borderColor(`╰${"─".repeat(Math.max(0, contentWidth + 2))}╯`),
+			borderColor(`${topLeft}${horizontal.repeat(Math.max(0, contentWidth + 2))}${topRight}`),
+			...innerLines.map((line) => `${borderColor(vertical)} ${padLine(line)} ${borderColor(vertical)}`),
+			borderColor(`${bottomLeft}${horizontal.repeat(Math.max(0, contentWidth + 2))}${bottomRight}`),
 		];
 		this.cachedWidth = width;
 		this.cachedLines = rendered;
