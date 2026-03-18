@@ -35,6 +35,7 @@
   },
   "dependencies": {
     "glimpseui": "^0.5.1",
+    "highlight.js": "^11.11.1",
     "jsonrepair": "^3.13.3"
   }
 }

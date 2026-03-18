@@ -1,5 +1,6 @@
 import { completeSimple, type ThinkingLevel } from "@mariozechner/pi-ai";
 import { type ExtensionAPI, type ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
+import hljs from "highlight.js";
 import { jsonrepair } from "jsonrepair";
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -338,6 +339,21 @@ function languageFromPath(path?: string): string | undefined {
 			".sql": "sql",
 		} as Record<string, string>
 	)[ext];
+}
+
+const HIGHLIGHT_LANGUAGE_ALIASES: Record<string, string> = {
+	ts: "typescript",
+	tsx: "tsx",
+	js: "javascript",
+	jsx: "jsx",
+	md: "markdown",
+	html: "xml",
+	text: "plaintext",
+};
+
+function normalizeHighlightLanguage(language?: string): string | undefined {
+	if (!language) return undefined;
+	return HIGHLIGHT_LANGUAGE_ALIASES[language.toLowerCase()] || language.toLowerCase();
 }
 
 function stripLineNumberPrefix(line: string): string {
@@ -1461,6 +1477,18 @@ function escapeHtml(text: string): string {
 		.replace(/'/g, "&#39;");
 }
 
+function highlightCodeHtml(code: string, language?: string): string {
+	const normalized = normalizeHighlightLanguage(language);
+	try {
+		if (normalized && hljs.getLanguage(normalized)) {
+			return hljs.highlight(code, { language: normalized, ignoreIllegals: true }).value;
+		}
+		return hljs.highlightAuto(code).value;
+	} catch {
+		return escapeHtml(code);
+	}
+}
+
 function renderFeedbackList(title: string, items?: string[]): string {
 	if (!items || items.length === 0) return "";
 	return `
@@ -1611,7 +1639,7 @@ button:hover { border-color: var(--accent); }
     </div>
     <div class="body">
       <div class="kicker">Loading</div>
-      <div class="headline">Starting quiz window immediately…</div>
+      <div class="headline">Starting quiz…</div>
       <div class="loading-row">
         <div class="spinner"></div>
         <div>${escapeHtml(message)}</div>
@@ -1620,7 +1648,7 @@ button:hover { border-color: var(--accent); }
       <div>
         <button onclick="closeQuiz()">Close</button>
       </div>
-      <div class="footer-note">You can leave this window open while the quiz is generated.</div>
+      <div class="footer-note">You can leave this window open while the questions are prepared.</div>
     </div>
   </div>
 <script>
@@ -1644,10 +1672,11 @@ function renderGlimpseQuizHtml(
 		typeof card.snippet?.startLine === "number" && typeof card.snippet?.endLine === "number"
 			? ` lines ${card.snippet.startLine}-${card.snippet.endLine}`
 			: "";
+	const snippetLanguage = normalizeHighlightLanguage(card.snippet?.language || languageFromPath(card.snippet?.path));
 	const snippetSection = card.snippet?.code
 		? `
 		<div class="section-label">Evidence${snippetMeta ? ` · ${escapeHtml(snippetMeta)}` : ""}${escapeHtml(lineRange)}</div>
-		<pre class="code"><code>${escapeHtml(card.snippet.code)}</code></pre>
+		<pre class="code"><code class="hljs${snippetLanguage ? ` language-${escapeHtml(snippetLanguage)}` : ""}">${highlightCodeHtml(card.snippet.code, snippetLanguage)}</code></pre>
 		`
 		: "";
 	const answer = state.draftAnswer ?? "";
@@ -1770,6 +1799,69 @@ body { padding: 18px; }
   font-size: 13px;
   line-height: 1.45;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.hljs { color: inherit; background: transparent; }
+.hljs-comment,
+.hljs-quote { color: #6a737d; font-style: italic; }
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-subst,
+.hljs-name,
+.hljs-literal { color: #d73a49; }
+.hljs-number,
+.hljs-variable,
+.hljs-template-variable,
+.hljs-regexp,
+.hljs-link { color: #005cc5; }
+.hljs-string,
+.hljs-doctag,
+.hljs-symbol,
+.hljs-bullet { color: #032f62; }
+.hljs-title,
+.hljs-section,
+.hljs-type,
+.hljs-class .hljs-title { color: #6f42c1; }
+.hljs-built_in,
+.hljs-builtin-name,
+.hljs-attr,
+.hljs-attribute { color: #e36209; }
+.hljs-meta,
+.hljs-meta .hljs-keyword,
+.hljs-selector-class,
+.hljs-selector-id { color: #22863a; }
+.hljs-addition { color: #22863a; }
+.hljs-deletion { color: #b31d28; }
+@media (prefers-color-scheme: dark) {
+  .hljs-comment,
+  .hljs-quote { color: #8b949e; }
+  .hljs-keyword,
+  .hljs-selector-tag,
+  .hljs-subst,
+  .hljs-name,
+  .hljs-literal { color: #ff7b72; }
+  .hljs-number,
+  .hljs-variable,
+  .hljs-template-variable,
+  .hljs-regexp,
+  .hljs-link { color: #79c0ff; }
+  .hljs-string,
+  .hljs-doctag,
+  .hljs-symbol,
+  .hljs-bullet { color: #a5d6ff; }
+  .hljs-title,
+  .hljs-section,
+  .hljs-type,
+  .hljs-class .hljs-title { color: #d2a8ff; }
+  .hljs-built_in,
+  .hljs-builtin-name,
+  .hljs-attr,
+  .hljs-attribute { color: #ffa657; }
+  .hljs-meta,
+  .hljs-meta .hljs-keyword,
+  .hljs-selector-class,
+  .hljs-selector-id,
+  .hljs-addition { color: #7ee787; }
+  .hljs-deletion { color: #ffa198; }
 }
 textarea {
   width: 100%;
