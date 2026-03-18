@@ -88,6 +88,12 @@ interface QuizPacket {
 	cards: QuizCard[];
 }
 
+interface QuizCompletionStats {
+	answered: number;
+	skipped: number;
+	questionSetsCompleted: number;
+}
+
 interface QuizDiscussionMessage {
 	role: "user" | "assistant";
 	text: string;
@@ -108,6 +114,7 @@ interface QuizRunRecord {
 	quitEarly: boolean;
 	answers: QuizRunAnswer[];
 	packet: QuizPacket;
+	packets?: QuizPacket[];
 }
 
 interface QuizAnswerFeedback {
@@ -119,7 +126,7 @@ interface QuizAnswerFeedback {
 }
 
 interface GlimpseQuizState {
-	stage: "loading" | "question" | "evaluating" | "reveal";
+	stage: "loading" | "question" | "evaluating" | "reveal" | "loading-more" | "complete";
 	draftAnswer?: string;
 	showHint?: boolean;
 	feedback?: QuizAnswerFeedback;
@@ -127,6 +134,7 @@ interface GlimpseQuizState {
 	discussionDraft?: string;
 	discussionPending?: boolean;
 	discussionMessages?: QuizDiscussionMessage[];
+	completionStats?: QuizCompletionStats;
 }
 
 interface GlimpseQuizLaunchResult {
@@ -1009,7 +1017,12 @@ function parseScopeArgs(args: string, cwd: string, repoRoot: string): { scope?: 
 	return { error: `Unrecognized quiz scope: ${trimmed}\n\nUsage:\n${USAGE}` };
 }
 
-function buildQuizPrompt(scope: ResolvedScope, sources: SourceItem[], audience: QuizAudience): string {
+function buildQuizPrompt(
+	scope: ResolvedScope,
+	sources: SourceItem[],
+	audience: QuizAudience,
+	previousCards: QuizCard[] = [],
+): string {
 	const sourceText = sources
 		.map((source) => {
 			const meta = [
@@ -1077,6 +1090,16 @@ function buildQuizPrompt(scope: ResolvedScope, sources: SourceItem[], audience: 
 		"Better question style: either show both definitions in the snippet, or ask only about PTState from the visible lines.",
 		"If file, manifest, or readme sources are available, prefer snippet-backed cards and include real snippets for at least 2 cards when helpful.",
 		"When writing snippet.code from numbered sources, strip the leading line-number prefixes like '  12 | ' and return only the actual code text.",
+		previousCards.length > 0 ? "Avoid repeating or lightly paraphrasing cards already asked in this quiz session. Prefer different files, different snippets, or a genuinely different conceptual angle." : undefined,
+		previousCards.length > 0
+			? [
+				"Already asked:",
+				...previousCards.slice(-16).map((card, index) => {
+					const where = [card.snippet?.path, card.snippet?.title].filter(Boolean).join(" · ");
+					return `- ${index + 1}. ${card.question}${where ? ` [${where}]` : ""}`;
+				}),
+			  ].join("\n")
+			: undefined,
 		"",
 		"Return JSON of the form:",
 		JSON.stringify(
@@ -1250,6 +1273,39 @@ function normalizePacket(raw: unknown, scope: ResolvedScope, sources: SourceItem
 	};
 }
 
+function withPacketSequence(packet: QuizPacket, sequence: number): QuizPacket {
+	return {
+		...packet,
+		cards: packet.cards.map((card, index) => ({
+			...card,
+			id: `set${sequence}:${safeString(card.id) || `q${index + 1}`}`,
+		})),
+	};
+}
+
+function mergeQuizPackets(packets: QuizPacket[]): QuizPacket {
+	if (packets.length === 0) throw new Error("No quiz packets to merge");
+	if (packets.length === 1) return packets[0]!;
+	const first = packets[0]!;
+	const last = packets[packets.length - 1]!;
+	const sourceRefs = Array.from(
+		new Map(
+			packets
+				.flatMap((packet) => packet.sourceRefs)
+				.map((sourceRef) => [`${sourceRef.id}|${sourceRef.path || ""}|${sourceRef.fingerprint}`, sourceRef]),
+		).values(),
+	);
+	return {
+		version: 1,
+		audience: first.audience,
+		scope: first.scope,
+		generatedAt: last.generatedAt,
+		sourceSummary: first.sourceSummary,
+		sourceRefs,
+		cards: packets.flatMap((packet) => packet.cards),
+	};
+}
+
 async function generateQuizPacket(
 	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
@@ -1258,10 +1314,11 @@ async function generateQuizPacket(
 	audience: QuizAudience,
 	signal: AbortSignal,
 	thinkingOverride?: QuizThinkingLevel,
+	previousCards: QuizCard[] = [],
 ): Promise<QuizPacket> {
 	if (!ctx.model) throw new Error("No active model selected");
 	const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
-	const prompt = buildQuizPrompt(scope, sources, audience);
+	const prompt = buildQuizPrompt(scope, sources, audience, previousCards);
 	const reasoning = ctx.model.reasoning ? toReasoning(thinkingOverride ?? pi.getThinkingLevel()) : undefined;
 
 	const response = await completeSimple(
@@ -1712,6 +1769,20 @@ function renderGlimpseQuizHtml(
 			</div>
 		`
 		: "";
+	const completionStats = state.completionStats;
+	const completionSection = completionStats
+		? `
+			<div class="completion-card">
+			  <div class="section-label">Quiz complete</div>
+			  <div class="question completion-title">Finished this question set.</div>
+			  <div class="footer-note">Answered ${completionStats.answered} · skipped ${completionStats.skipped} · sets completed ${completionStats.questionSetsCompleted}</div>
+			  <div class="actions">
+			    <button class="primary" onclick="moreQuestions()">More questions</button>
+			    <button class="ghost" onclick="closeQuiz()">Close</button>
+			  </div>
+			</div>
+		`
+		: "";
 
 	const questionActions = `
 		<div class="actions">
@@ -1726,7 +1797,7 @@ function renderGlimpseQuizHtml(
 	const revealActions = `
 		<div class="actions">
 		  <button onclick="${discussionOpen ? "hideDiscussion()" : "openDiscussion()"}">${discussionOpen ? "Hide discussion" : "Discuss further"}</button>
-		  <button class="primary" onclick="nextQuestion()">${index < packet.cards.length ? "Next question" : "Finish"}</button>
+		  <button class="primary" onclick="nextQuestion()">${index < packet.cards.length ? "Next question" : "Finish set"}</button>
 		  <button class="ghost" onclick="closeQuiz()">Close</button>
 		</div>
 	`;
@@ -1924,6 +1995,8 @@ button:disabled { opacity: 0.65; cursor: default; }
 .feedback-title { font-size: 13px; font-weight: 700; color: var(--muted); margin-bottom: 6px; }
 .feedback-block ul { margin: 8px 0 0 18px; padding: 0; }
 .footer-note { font-size: 12px; color: var(--muted); }
+.completion-card { display: grid; gap: 12px; }
+.completion-title { font-size: 24px; }
 .discussion-input { min-height: 110px; }
 .chat-thread {
   display: grid;
@@ -1991,18 +2064,21 @@ button:disabled { opacity: 0.65; cursor: default; }
     <div class="header">
       <div>
         <div class="title">Code Quiz</div>
-        <div class="meta">Question ${index}/${packet.cards.length}</div>
+        <div class="meta">${escapeHtml(state.stage === "complete" ? "Set complete" : `Question ${index}/${packet.cards.length}`)}</div>
       </div>
       <div class="meta">${escapeHtml(packet.scope.label)}</div>
     </div>
     <div class="body">
-      ${state.stage === "loading" || state.stage === "evaluating" ? `
+      ${state.stage === "loading" || state.stage === "evaluating" || state.stage === "loading-more" ? `
         <div class="loading">
           <div class="spinner"></div>
-          <div class="question">${escapeHtml(state.stage === "loading" ? "Generating your quiz…" : "Evaluating your answer…")}</div>
-          <div class="footer-note">${escapeHtml(state.stage === "loading" ? "Preparing a gentle, code-anchored set of questions." : "Comparing your answer with the ideal answer.")}</div>
+          <div class="question">${escapeHtml(state.stage === "evaluating" ? "Evaluating your answer…" : state.stage === "loading-more" ? "Generating more questions…" : "Generating your quiz…")}</div>
+          <div class="footer-note">${escapeHtml(state.stage === "evaluating" ? "Comparing your answer with the ideal answer." : state.stage === "loading-more" ? "Looking for new angles without repeating the same questions." : "Preparing a gentle, code-anchored set of questions.")}</div>
         </div>
         <div class="actions"><button class="ghost" onclick="closeQuiz()">Close</button></div>
+      ` : state.stage === "complete" ? `
+        <div class="scope">${escapeHtml(packet.sourceSummary)}</div>
+        ${completionSection}
       ` : `
         <div class="scope">${escapeHtml(packet.sourceSummary)}</div>
         ${snippetSection}
@@ -2053,15 +2129,20 @@ button:disabled { opacity: 0.65; cursor: default; }
   function toggleHint() { send({ type: 'toggle-hint', answer: currentAnswer() }); }
   function skipQuestion() { send({ type: 'skip' }); }
   function nextQuestion() { send({ type: 'next' }); }
+  function moreQuestions() { send({ type: 'more-questions' }); }
   function openDiscussion() { send({ type: 'open-discussion', answer: currentAnswer(), discussion: currentDiscussion() }); }
   function hideDiscussion() { send({ type: 'hide-discussion', answer: currentAnswer(), discussion: currentDiscussion() }); }
   function sendFollowUp() { send({ type: 'send-follow-up', answer: currentAnswer(), discussion: currentDiscussion() }); }
   function closeQuiz() { send({ type: 'close' }); }
   document.addEventListener('keydown', (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-      e.preventDefault();
-      if (discussionEl()) sendFollowUp();
-      else submitAnswer();
+      if (discussionEl()) {
+        e.preventDefault();
+        sendFollowUp();
+      } else if (answerEl()) {
+        e.preventDefault();
+        submitAnswer();
+      }
     }
     if (e.key === 'Escape') { e.preventDefault(); closeQuiz(); }
   });
@@ -2091,6 +2172,7 @@ async function runGlimpseQuizFlow(
 		let finished = false;
 		let generationError: string | undefined;
 		let packet: QuizPacket | undefined;
+		const packets: QuizPacket[] = [];
 		const answers: QuizRunAnswer[] = [];
 		let index = 0;
 		let state: GlimpseQuizState = {
@@ -2153,9 +2235,36 @@ async function runGlimpseQuizFlow(
 				discussionDraft: "",
 				discussionPending: false,
 				discussionMessages: [],
+				completionStats: undefined,
 			};
 			currentRecord = null;
 			currentPersisted = false;
+		};
+		const showCompletionState = () => {
+			state = {
+				stage: "complete",
+				completionStats: {
+					answered: answers.filter((entry) => !entry.skipped).length,
+					skipped: answers.filter((entry) => entry.skipped).length,
+					questionSetsCompleted: packets.length,
+				},
+				draftAnswer: "",
+				showHint: false,
+				discussionOpen: false,
+				discussionDraft: "",
+				discussionPending: false,
+				discussionMessages: [],
+			};
+			currentRecord = null;
+			currentPersisted = true;
+		};
+		const activatePacket = (generatedPacket: QuizPacket) => {
+			const sequencedPacket = withPacketSequence(generatedPacket, packets.length + 1);
+			packet = sequencedPacket;
+			packets.push(sequencedPacket);
+			index = 0;
+			pi.appendEntry("code-quiz.packet", sequencedPacket);
+			resetQuestionState();
 		};
 		const rerender = () => {
 			if (finished) return;
@@ -2173,14 +2282,16 @@ async function runGlimpseQuizFlow(
 			generationAbort.abort();
 			abortPendingRequest();
 			activeQuizClose = null;
-			if (packet) {
+			if (packets.length > 0) {
+				const mergedPacket = mergeQuizPackets(packets);
 				resolve({
-					packet,
+					packet: mergedPacket,
 					run: {
 						completedAt: new Date().toISOString(),
-						quitEarly: answers.length < packet.cards.length,
+						quitEarly: state.stage !== "complete",
 						answers,
-						packet,
+						packet: mergedPacket,
+						packets: packets.length > 1 ? packets.map((entry) => ({ ...entry })) : undefined,
 					},
 				});
 				return;
@@ -2221,12 +2332,12 @@ async function runGlimpseQuizFlow(
 					abortPendingRequest();
 					answers.push(snapshotCurrentRecord(currentCard.id, answer, { skipped: true }));
 					if (index >= packet.cards.length - 1) {
-						windowHandle.close();
+						showCompletionState();
 					} else {
 						index++;
 						resetQuestionState();
-						rerender();
 					}
+					rerender();
 					return;
 				case "reveal":
 					state = {
@@ -2378,16 +2489,62 @@ async function runGlimpseQuizFlow(
 					}
 					return;
 				}
+				case "more-questions": {
+					if (state.stage !== "complete") return;
+					abortPendingRequest();
+					const previousCards = packets.flatMap((entry) => entry.cards);
+					const previousCompletionStats = state.completionStats;
+					state = {
+						...state,
+						stage: "loading-more",
+						discussionOpen: false,
+						discussionPending: false,
+						completionStats: previousCompletionStats,
+					};
+					rerender();
+					const requestAbort = new AbortController();
+					pendingRequestAbort = requestAbort;
+					try {
+						const generatedPacket = await generateQuizPacket(
+							pi,
+							ctx,
+							scope,
+							sources,
+							audience,
+							requestAbort.signal,
+							thinkingOverride,
+							previousCards,
+						);
+						if (finished || requestAbort.signal.aborted) return;
+						activatePacket(generatedPacket);
+						rerender();
+					} catch (error) {
+						if (finished || requestAbort.signal.aborted) return;
+						state = {
+							...state,
+							stage: "complete",
+							completionStats: previousCompletionStats,
+						};
+						rerender();
+						ctx.ui.notify(
+							error instanceof Error ? `Failed to generate more questions: ${error.message}` : "Failed to generate more questions",
+							"error",
+						);
+					} finally {
+						if (pendingRequestAbort === requestAbort) pendingRequestAbort = null;
+					}
+					return;
+				}
 				case "next":
 					abortPendingRequest();
 					persistCurrentRecord();
 					if (index >= packet.cards.length - 1) {
-						windowHandle.close();
+						showCompletionState();
 					} else {
 						index++;
 						resetQuestionState();
-						rerender();
 					}
+					rerender();
 					return;
 			}
 		});
@@ -2400,9 +2557,7 @@ async function runGlimpseQuizFlow(
 		generateQuizPacket(pi, ctx, scope, sources, audience, generationAbort.signal, thinkingOverride)
 			.then((generatedPacket) => {
 				if (finished) return;
-				packet = generatedPacket;
-				pi.appendEntry("code-quiz.packet", generatedPacket);
-				resetQuestionState();
+				activatePacket(generatedPacket);
 				rerender();
 			})
 			.catch((err) => {

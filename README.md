@@ -10,9 +10,9 @@ Instead of summarizing code for you, `pi-code-quiz` shows a real snippet, asks a
 
 ## What it does
 
-- Opens a native quiz window with a code snippet, question, and answer box
-- Builds quizzes from the current `workset`, `session`, `repo`, or a specific file
-- Uses pi's active model and thinking level
+- Opens a Glimpse quiz window with a code snippet, question, and answer box
+- Builds quizzes from the current `workset` (inferred active files), `session`, `repo`, or a specific file
+- Uses pi's active model; thinking level defaults to current but can be set
 - Keeps questions anchored to visible code snippets
 - Gives short feedback plus an ideal answer after you submit
 - Lets you open a per-question **Discuss further** thread
@@ -22,7 +22,7 @@ Instead of summarizing code for you, `pi-code-quiz` shows a real snippet, asks a
 
 | Command | Description |
 |---|---|
-| `/quiz` | Quiz the current workset |
+| `/quiz` | Quiz the current workset (inferred active files) |
 | `/quiz workset` | Explicitly quiz the current workset |
 | `/quiz session` | Quiz files strongly associated with the current session |
 | `/quiz repo` | Quiz repo-level structure and central code |
@@ -68,8 +68,9 @@ After installing, reload or restart pi.
 - `pi-code-quiz` is for **active recall and code understanding**, not passive summaries.
 - Questions are intended to be answerable from the snippet shown in the quiz window.
 - After feedback is shown, you can open a short **Discuss further** thread for that card.
+- After a set is finished, you can generate more questions from the same scope.
 - Quiz packets and quiz runs are stored as hidden session entries.
-- The current UI uses a native Glimpse window.
+- The current UI uses a Glimpse window. This version has mainly been tested on macOS.
 
 ## License
 
