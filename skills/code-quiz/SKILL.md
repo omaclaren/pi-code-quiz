@@ -5,7 +5,7 @@ description: Scope-first active code-reading and code-understanding in quiz form
 
 # Code Quiz
 
-This package adds a `/quiz` command for active code-understanding. It opens a native Glimpse quiz window by default.
+This package adds a `/quiz` command for active code-understanding. It opens a native Glimpse quiz window.
 
 ## When to use
 
@@ -23,7 +23,9 @@ Use this when the user wants:
 /quiz session
 /quiz repo
 /quiz file <path>
-/quiz-glimpse        # alias for /quiz
+/quiz repo --audience scientist
+/quiz repo --mode sci
+/quiz-close
 ```
 
 ## Question style
@@ -36,6 +38,11 @@ The tutor should prefer questions that probe:
 - what would change if some parameter / branch / interface changed
 - how one would detect likely failure modes
 - in plain, direct language rather than formal or overly clever wording
+
+Audience profiles:
+- `general` / `gen` — balanced, accessible questions
+- `scientist` / `sci` — representation, quantities, transformations, assumptions, perturbations
+- `developer` / `dev` — interfaces, control flow, contracts, extension points, debugging/refactoring
 
 Avoid trivia like:
 - tests

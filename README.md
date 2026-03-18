@@ -15,8 +15,8 @@ This package currently focuses on a small, low-overhead workflow:
 
 - one main command: `/quiz`
 - `/quiz` opens a native **Glimpse** window
-- `/quiz-glimpse` is kept as an alias
 - scope is central: `workset`, `session`, `repo`, `file <path>`
+- supports lightweight audience profiles via `--audience` or `--mode`
 - uses the **active model** and **active thinking level** for quiz generation
 - stores generated quiz packets as **hidden session entries**
 - starts the Glimpse window immediately, then fills in the quiz once generation completes
@@ -36,10 +36,21 @@ It is **not** trying to be an Anki clone or a full spaced-repetition framework y
 /quiz src/foo.ts                  # shorthand for file scope when path exists
 /quiz repo --thinking off         # faster / less reasoning
 /quiz file src/foo.ts --thinking low
-/quiz-glimpse                     # alias for /quiz
-/quiz-glimpse repo --thinking off
+/quiz repo --audience scientist   # audience profiles: general, scientist, developer
+/quiz repo --mode sci             # --mode is an alias for --audience
+/quiz file src/foo.ts --audience developer --thinking low
 /quiz-close                       # close the active quiz window
 ```
+
+## Audience profiles
+
+The quiz can lightly shift what it optimizes for:
+
+- `general` / `gen` — accessible, mixed conceptual + code-mechanics questions; this is the default
+- `scientist` / `sci` — emphasizes meaning of quantities, state representations, transformations, assumptions, and perturbations
+- `developer` / `dev` — emphasizes interfaces, control flow, contracts, extension points, debugging, and refactoring consequences
+
+This is meant to be a small prompt-level bias, not a giant separate feature branch.
 
 ## Question style
 
@@ -60,7 +71,7 @@ But the **default ramp is intentionally gentle**:
 
 It explicitly avoids generic dev-process trivia such as tests, CI, file layout, naming conventions, or tooling unless they are central to the abstraction being learned.
 
-The intended audience is someone who wants a **scientist / engineer / applied-maths** style understanding:
+The scientist-oriented profile especially aims for questions like:
 
 - what is this thing really representing?
 - how do I use it correctly?

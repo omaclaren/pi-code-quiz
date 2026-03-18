@@ -10,6 +10,7 @@ type ScopeKind = "workset" | "session" | "repo" | "file";
 type SourceKind = "conversation" | "file" | "readme" | "manifest" | "tree";
 type Lens = "abstraction" | "usage" | "mechanism" | "assumption" | "change" | "debugging";
 type Depth = "foundational" | "intermediate" | "subtle" | "transfer";
+type QuizAudience = "general" | "scientist" | "developer";
 
 type SessionBranchEntry = {
 	type?: string;
@@ -74,6 +75,7 @@ interface QuizCard {
 
 interface QuizPacket {
 	version: 1;
+	audience: QuizAudience;
 	scope: {
 		kind: ScopeKind;
 		label: string;
@@ -125,6 +127,7 @@ type QuizThinkingLevel = "off" | ThinkingLevel;
 interface ParsedQuizCommandArgs {
 	scope?: ResolvedScope;
 	thinkingLevel?: QuizThinkingLevel;
+	audience: QuizAudience;
 	error?: string;
 }
 
@@ -250,9 +253,21 @@ const USAGE = [
 	"/quiz <path-to-file>",
 	"/quiz repo --thinking off",
 	"/quiz file src/foo.ts --thinking low",
+	"/quiz repo --audience scientist",
+	"/quiz repo --mode sci",
+	"/quiz file src/foo.ts --audience developer --thinking low",
 ].join("\n");
 
 const QUIZ_THINKING_LEVELS: QuizThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+const DEFAULT_QUIZ_AUDIENCE: QuizAudience = "general";
+const QUIZ_AUDIENCE_ALIASES: Record<string, QuizAudience> = {
+	general: "general",
+	gen: "general",
+	scientist: "scientist",
+	sci: "scientist",
+	developer: "developer",
+	dev: "developer",
+};
 
 function hashText(text: string): string {
 	return createHash("sha256").update(text).digest("hex").slice(0, 16);
@@ -834,9 +849,48 @@ function isQuizThinkingLevel(value: string): value is QuizThinkingLevel {
 	return QUIZ_THINKING_LEVELS.includes(value as QuizThinkingLevel);
 }
 
+function normalizeQuizAudience(value: string): QuizAudience | undefined {
+	return QUIZ_AUDIENCE_ALIASES[value.toLowerCase()];
+}
+
+function audienceLabel(audience: QuizAudience): string {
+	switch (audience) {
+		case "scientist":
+			return "scientist";
+		case "developer":
+			return "developer";
+		default:
+			return "general";
+	}
+}
+
+function audiencePromptGuidance(audience: QuizAudience): string[] {
+	switch (audience) {
+		case "scientist":
+			return [
+				"Audience profile: scientist / applied mathematician / engineer.",
+				"Bias toward what quantities or states are being represented, what the pieces mean physically or mathematically, how values are packed/unpacked or transformed, what assumptions matter for the model, and what changes under perturbation.",
+				"Prefer questions that help the user form an intuitive model of the system rather than software-architecture trivia.",
+			];
+		case "developer":
+			return [
+				"Audience profile: software developer.",
+				"Bias toward interfaces, control flow, contracts, invariants, extension points, edge cases, and likely debugging or refactoring consequences.",
+				"Direct wording still matters, but moderate software-engineering language is acceptable.",
+			];
+		default:
+			return [
+				"Audience profile: general.",
+				"Blend conceptual meaning with code mechanics. Keep wording accessible. Do not assume deep domain expertise or advanced software jargon.",
+				"Prefer straightforward, operational questions that a broadly technical user can answer from the code.",
+			];
+	}
+}
+
 function parseQuizCommandArgs(args: string, cwd: string, repoRoot: string): ParsedQuizCommandArgs {
 	let remaining = args.trim();
 	let thinkingLevel: QuizThinkingLevel | undefined;
+	let audience = DEFAULT_QUIZ_AUDIENCE;
 
 	const explicitMatch = /(?:^|\s)--thinking\s+(off|minimal|low|medium|high|xhigh)(?=\s|$)/i.exec(remaining);
 	if (explicitMatch) {
@@ -847,6 +901,7 @@ function parseQuizCommandArgs(args: string, cwd: string, repoRoot: string): Pars
 		if (malformedThinking) {
 			const attempted = malformedThinking[1] || "<missing>";
 			return {
+				audience,
 				error: `Invalid thinking level: ${attempted}. Use one of: ${QUIZ_THINKING_LEVELS.join(", ")}\n\nUsage:\n${USAGE}`,
 			};
 		}
@@ -860,8 +915,30 @@ function parseQuizCommandArgs(args: string, cwd: string, repoRoot: string): Pars
 		}
 	}
 
+	const explicitAudience = /(?:^|\s)--(?:audience|mode)\s+(\S+)(?=\s|$)/i.exec(remaining);
+	if (explicitAudience) {
+		const normalized = normalizeQuizAudience(explicitAudience[1]!);
+		if (!normalized) {
+			return {
+				audience,
+				error: `Invalid audience: ${explicitAudience[1]}. Use one of: general (gen), scientist (sci), developer (dev)\n\nUsage:\n${USAGE}`,
+			};
+		}
+		audience = normalized;
+		remaining = `${remaining.slice(0, explicitAudience.index)} ${remaining.slice(explicitAudience.index + explicitAudience[0].length)}`.trim();
+	} else {
+		const malformedAudience = /(?:^|\s)--(?:audience|mode)(?:\s+(\S+))?/i.exec(remaining);
+		if (malformedAudience) {
+			const attempted = malformedAudience[1] || "<missing>";
+			return {
+				audience,
+				error: `Invalid audience: ${attempted}. Use one of: general (gen), scientist (sci), developer (dev)\n\nUsage:\n${USAGE}`,
+			};
+		}
+	}
+
 	const parsedScope = parseScopeArgs(remaining, cwd, repoRoot);
-	return { ...parsedScope, thinkingLevel };
+	return { ...parsedScope, thinkingLevel, audience };
 }
 
 function parseScopeArgs(args: string, cwd: string, repoRoot: string): { scope?: ResolvedScope; error?: string } {
@@ -902,7 +979,7 @@ function parseScopeArgs(args: string, cwd: string, repoRoot: string): { scope?: 
 	return { error: `Unrecognized quiz scope: ${trimmed}\n\nUsage:\n${USAGE}` };
 }
 
-function buildQuizPrompt(scope: ResolvedScope, sources: SourceItem[]): string {
+function buildQuizPrompt(scope: ResolvedScope, sources: SourceItem[], audience: QuizAudience): string {
 	const sourceText = sources
 		.map((source) => {
 			const meta = [
@@ -918,18 +995,32 @@ function buildQuizPrompt(scope: ResolvedScope, sources: SourceItem[]): string {
 		.join("\n\n");
 
 	const scopeGuidance =
-		scope.kind === "repo"
-			? "Bias toward architecture, boundaries, extension points, and how the codebase is meant to be used, while using any recent conversation context to prioritize what matters now."
-			: scope.kind === "file"
-				? "Bias toward the file's core abstraction, how to use it, key mechanism, and subtle assumptions."
-				: "Bias toward what the user is actively touching or has recently reasoned about.";
+		audience === "scientist"
+			? scope.kind === "repo"
+				? "Bias toward the repo's main modelling pieces, what quantities or states they represent, how values move through them, and which files carry the main conceptual load."
+				: scope.kind === "file"
+					? "Bias toward what this file represents, what quantities or structures it manipulates, how values are transformed, and what assumptions matter for the model."
+					: "Bias toward the modelling ideas and data transformations the user is actively touching or has recently reasoned about."
+			: audience === "developer"
+				? scope.kind === "repo"
+					? "Bias toward architecture, boundaries, extension points, and how the codebase is meant to be used, while using any recent conversation context to prioritize what matters now."
+					: scope.kind === "file"
+						? "Bias toward the file's core abstraction, how to use it, key mechanism, and subtle assumptions."
+						: "Bias toward what the user is actively touching or has recently reasoned about."
+				: scope.kind === "repo"
+					? "Bias toward the repo's main abstractions, how parts fit together, how the codebase is meant to be used, and what current conversation context makes most important right now."
+					: scope.kind === "file"
+						? "Bias toward the file's core abstraction, what it is for, how to use it, and the main mechanism it implements."
+						: "Bias toward what the user is actively touching or has recently reasoned about.";
 
 	return [
 		`Scope: ${scope.kind}`,
 		`Scope label: ${scope.label}`,
 		scope.path ? `Scope path: ${scope.path}` : undefined,
+		`Audience: ${audienceLabel(audience)}`,
 		"",
 		scopeGuidance,
+		...audiencePromptGuidance(audience),
 		"",
 		`Create ${CARD_COUNT} quiz cards.`,
 		"Default stance: the user is still orienting to the code and needs a gentle ramp, not an oral exam or a trap-heavy critique.",
@@ -1038,7 +1129,7 @@ function defaultSourceSummary(scope: ResolvedScope, sources: SourceItem[]): stri
 	return labels.length > 0 ? `${scope.label}: ${labels.join(", ")}` : scope.label;
 }
 
-function normalizePacket(raw: unknown, scope: ResolvedScope, sources: SourceItem[]): QuizPacket {
+function normalizePacket(raw: unknown, scope: ResolvedScope, sources: SourceItem[], audience: QuizAudience): QuizPacket {
 	if (!raw || typeof raw !== "object") throw new Error("Quiz payload was not an object");
 
 	const sourceMap = new Map(sources.map((source) => [source.id, source]));
@@ -1105,6 +1196,7 @@ function normalizePacket(raw: unknown, scope: ResolvedScope, sources: SourceItem
 
 	return {
 		version: 1,
+		audience,
 		scope: {
 			kind: scope.kind,
 			label: scope.label,
@@ -1129,12 +1221,13 @@ async function generateQuizPacket(
 	ctx: ExtensionCommandContext,
 	scope: ResolvedScope,
 	sources: SourceItem[],
+	audience: QuizAudience,
 	signal: AbortSignal,
 	thinkingOverride?: QuizThinkingLevel,
 ): Promise<QuizPacket> {
 	if (!ctx.model) throw new Error("No active model selected");
 	const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
-	const prompt = buildQuizPrompt(scope, sources);
+	const prompt = buildQuizPrompt(scope, sources, audience);
 	const reasoning = ctx.model.reasoning ? toReasoning(thinkingOverride ?? pi.getThinkingLevel()) : undefined;
 
 	const response = await completeSimple(
@@ -1160,7 +1253,7 @@ async function generateQuizPacket(
 	if (repaired && ctx.hasUI) {
 		ctx.ui.notify("Quiz JSON was malformed; repaired automatically", "info");
 	}
-	return normalizePacket(data, scope, sources);
+	return normalizePacket(data, scope, sources, audience);
 }
 
 const ANSWER_FEEDBACK_SYSTEM_PROMPT = `You are a concise, supportive code tutor.
@@ -1171,6 +1264,7 @@ Requirements:
 - Be supportive, not adversarial.
 - Prefer short, concrete feedback over long essays.
 - Point out what the user got right and what they missed.
+- Respect the intended audience profile when judging what counts as a good answer.
 - Do not nitpick wording if the conceptual understanding is correct.
 - Return STRICT JSON only.
 
@@ -1217,6 +1311,7 @@ async function evaluateQuizAnswer(
 	ctx: ExtensionCommandContext,
 	card: QuizCard,
 	answer: string,
+	audience: QuizAudience,
 	thinkingOverride?: QuizThinkingLevel,
 	signal?: AbortSignal,
 ): Promise<QuizAnswerFeedback> {
@@ -1227,6 +1322,7 @@ async function evaluateQuizAnswer(
 		? `Evidence snippet (${card.snippet.path || card.snippet.title || "snippet"}):\n${card.snippet.code}`
 		: "No snippet provided.";
 	const prompt = [
+		`Audience: ${audienceLabel(audience)}`,
 		`Question: ${card.question}`,
 		snippetText,
 		card.hint ? `Hint shown to user: ${card.hint}` : undefined,
@@ -1679,12 +1775,14 @@ async function runGlimpseQuizFlow(
 	ctx: ExtensionCommandContext,
 	scope: ResolvedScope,
 	sources: SourceItem[],
+	audience: QuizAudience,
 	thinkingOverride?: QuizThinkingLevel,
 ): Promise<GlimpseQuizLaunchResult> {
 	const { open } = await loadGlimpseModule();
 	const effectiveThinkingLevel = thinkingOverride ?? pi.getThinkingLevel();
 	const thinkingLabel = ctx.model?.reasoning ? ` · thinking ${effectiveThinkingLevel}` : "";
-	const loadingMessage = `Generating quiz with ${ctx.model?.id || "current model"}${thinkingLabel}...`;
+	const audienceSuffix = audience === DEFAULT_QUIZ_AUDIENCE ? "" : ` · ${audienceLabel(audience)}`;
+	const loadingMessage = `Generating quiz with ${ctx.model?.id || "current model"}${thinkingLabel}${audienceSuffix}...`;
 	const loadingSummary = defaultSourceSummary(scope, sources);
 
 	return await new Promise<GlimpseQuizLaunchResult>((resolve) => {
@@ -1799,7 +1897,7 @@ async function runGlimpseQuizFlow(
 					currentPersisted = false;
 					rerender();
 					try {
-						const feedback = await evaluateQuizAnswer(ctx, currentCard, answer, thinkingOverride, evaluationAbort.signal);
+						const feedback = await evaluateQuizAnswer(ctx, currentCard, answer, audience, thinkingOverride, evaluationAbort.signal);
 						if (finished) return;
 						state = {
 							stage: "reveal",
@@ -1844,7 +1942,7 @@ async function runGlimpseQuizFlow(
 			finish();
 		});
 
-		generateQuizPacket(pi, ctx, scope, sources, generationAbort.signal, thinkingOverride)
+		generateQuizPacket(pi, ctx, scope, sources, audience, generationAbort.signal, thinkingOverride)
 			.then((generatedPacket) => {
 				if (finished) return;
 				packet = generatedPacket;
@@ -1864,10 +1962,9 @@ async function handleGlimpseQuizCommand(
 	pi: ExtensionAPI,
 	args: string,
 	ctx: ExtensionCommandContext,
-	commandName = "/quiz",
 ): Promise<void> {
 	if (!ctx.hasUI) {
-		ctx.ui.notify(`${commandName} requires interactive mode`, "error");
+		ctx.ui.notify("/quiz requires interactive mode", "error");
 		return;
 	}
 	if (!ctx.model) {
@@ -1877,7 +1974,7 @@ async function handleGlimpseQuizCommand(
 
 	const cwd = process.cwd();
 	const repoRoot = getRepoRoot(cwd);
-	const { scope, thinkingLevel, error } = parseQuizCommandArgs(args || "", cwd, repoRoot);
+	const { scope, thinkingLevel, audience, error } = parseQuizCommandArgs(args || "", cwd, repoRoot);
 	if (!scope) {
 		ctx.ui.notify(error || "Failed to resolve quiz scope", "error");
 		return;
@@ -1892,7 +1989,7 @@ async function handleGlimpseQuizCommand(
 	if (activeQuizClose) activeQuizClose();
 
 	try {
-		const { packet, run, error: quizError } = await runGlimpseQuizFlow(pi, ctx, scope, sources, thinkingLevel);
+		const { packet, run, error: quizError } = await runGlimpseQuizFlow(pi, ctx, scope, sources, audience, thinkingLevel);
 		if (quizError) {
 			ctx.ui.notify(quizError, quizError === "Quiz generation cancelled" ? "info" : "error");
 			return;
@@ -1930,14 +2027,7 @@ export default function activeCodeTutor(pi: ExtensionAPI) {
 	pi.registerCommand("quiz", {
 		description: "Open an active code-understanding quiz in a native Glimpse window",
 		handler: async (args, ctx) => {
-			await handleGlimpseQuizCommand(pi, args || "", ctx, "/quiz");
-		},
-	});
-
-	pi.registerCommand("quiz-glimpse", {
-		description: "Alias for /quiz using the native Glimpse quiz window",
-		handler: async (args, ctx) => {
-			await handleGlimpseQuizCommand(pi, args || "", ctx, "/quiz-glimpse");
+			await handleGlimpseQuizCommand(pi, args || "", ctx);
 		},
 	});
 }
