@@ -900,6 +900,7 @@ function audiencePromptGuidance(audience: QuizAudience): string[] {
 				"Audience profile: scientist / applied mathematician / engineer.",
 				"Bias toward what quantities or states are being represented, what the pieces mean physically or mathematically, how values are packed/unpacked or transformed, what assumptions matter for the model, and what changes under perturbation.",
 				"Prefer questions that help the user form an intuitive model of the system rather than software-architecture trivia.",
+				"Avoid purely software-contract questions like constructor invariants unless they clearly express something physically or mathematically meaningful about the model.",
 			];
 		case "developer":
 			return [
