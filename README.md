@@ -14,10 +14,12 @@ The goal is not to generate polished summaries. The goal is to force **active en
 This package currently focuses on a small, low-overhead workflow:
 
 - one main command: `/quiz`
+- experimental richer UI via `/quiz-glimpse`
 - scope is central: `workset`, `session`, `repo`, `file <path>`
 - uses the **active model** and **active thinking level** for quiz generation
 - stores generated quiz packets as **hidden session entries**
-- shows the quiz in an **overlay side panel** rather than replacing the main transcript
+- shows the default quiz in an **overlay side panel** rather than replacing the main transcript
+- can also open a native **Glimpse** window with richer answer/feedback interaction
 - shows real snippets as evidence, but only in service of a question
 
 It is **not** trying to be an Anki clone or a full spaced-repetition framework yet.
@@ -33,8 +35,10 @@ It is **not** trying to be an Anki clone or a full spaced-repetition framework y
 /quiz src/foo.ts                  # shorthand for file scope when path exists
 /quiz repo --thinking off         # faster / less reasoning
 /quiz file src/foo.ts --thinking low
-/quiz-focus                       # focus/unfocus the quiz overlay
-/quiz-close                       # close the quiz overlay
+/quiz-glimpse                     # native Glimpse window with richer answer/feedback UI
+/quiz-glimpse repo --thinking off
+/quiz-focus                       # focus/unfocus the TUI quiz overlay
+/quiz-close                       # close the active quiz surface
 ```
 
 Shortcut:

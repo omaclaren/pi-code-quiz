@@ -5,7 +5,9 @@ import { jsonrepair } from "jsonrepair";
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { basename, extname, join, relative, resolve } from "node:path";
+import { createRequire } from "node:module";
+import { basename, dirname, extname, join, relative, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 type ScopeKind = "workset" | "session" | "repo" | "file";
 type SourceKind = "conversation" | "file" | "readme" | "manifest" | "tree";
@@ -100,6 +102,21 @@ interface QuizRunRecord {
 	packet: QuizPacket;
 }
 
+interface QuizAnswerFeedback {
+	assessment: "good" | "partial" | "miss";
+	feedback: string;
+	gotRight?: string[];
+	missed?: string[];
+	nextFocus?: string;
+}
+
+interface GlimpseQuizState {
+	stage: "loading" | "question" | "evaluating" | "reveal";
+	draftAnswer?: string;
+	showHint?: boolean;
+	feedback?: QuizAnswerFeedback;
+}
+
 type QuestionStageAction = "answer" | "reveal" | "skip" | "quit";
 type RevealStageAction = "next" | "quit";
 type QuizThinkingLevel = "off" | ThinkingLevel;
@@ -112,6 +129,9 @@ interface ParsedQuizCommandArgs {
 
 let activeQuizOverlayHandle: OverlayHandle | null = null;
 let activeQuizClose: (() => void) | null = null;
+
+const require = createRequire(import.meta.url);
+let glimpseModulePromise: Promise<any> | null = null;
 
 const MAX_CONVERSATION_MESSAGES = 8;
 const MAX_TRACKED_FILES = 3;
@@ -981,7 +1001,7 @@ function extractJsonPayload(text: string): string {
 	throw new Error("Model did not return JSON");
 }
 
-function parseQuizPayloadText(text: string): { data: unknown; repaired: boolean } {
+function parseJsonPayloadText(text: string, label: string): { data: unknown; repaired: boolean } {
 	const payload = extractJsonPayload(text);
 	try {
 		return { data: JSON.parse(payload), repaired: false };
@@ -991,7 +1011,7 @@ function parseQuizPayloadText(text: string): { data: unknown; repaired: boolean 
 		} catch (repairError) {
 			const parseMessage = parseError instanceof Error ? parseError.message : String(parseError);
 			const repairMessage = repairError instanceof Error ? repairError.message : String(repairError);
-			throw new Error(`Failed to parse quiz JSON (${parseMessage}; repair failed: ${repairMessage})`);
+			throw new Error(`Failed to parse ${label} JSON (${parseMessage}; repair failed: ${repairMessage})`);
 		}
 	}
 }
@@ -1131,11 +1151,543 @@ async function generateQuizPacket(
 		.map((part) => part.text)
 		.join("\n");
 
-	const { data, repaired } = parseQuizPayloadText(responseText);
+	const { data, repaired } = parseJsonPayloadText(responseText, "quiz");
 	if (repaired && ctx.hasUI) {
 		ctx.ui.notify("Quiz JSON was malformed; repaired automatically", "info");
 	}
 	return normalizePacket(data, scope, sources);
+}
+
+const ANSWER_FEEDBACK_SYSTEM_PROMPT = `You are a concise, supportive code tutor.
+
+Given a quiz question, an ideal answer, and the user's answer, evaluate the user's answer briefly and constructively.
+
+Requirements:
+- Be supportive, not adversarial.
+- Prefer short, concrete feedback over long essays.
+- Point out what the user got right and what they missed.
+- Do not nitpick wording if the conceptual understanding is correct.
+- Return STRICT JSON only.
+
+JSON shape:
+{
+  "assessment": "good" | "partial" | "miss",
+  "feedback": "2-4 concise sentences",
+  "gotRight": ["..."],
+  "missed": ["..."],
+  "nextFocus": "optional one-line suggestion"
+}
+`;
+
+function stringArray(value: unknown): string[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	const items = value.filter((item): item is string => typeof item === "string" && item.trim().length > 0).map((item) => item.trim());
+	return items.length > 0 ? items : undefined;
+}
+
+function normalizeAnswerFeedback(raw: unknown): QuizAnswerFeedback {
+	if (!raw || typeof raw !== "object") {
+		return {
+			assessment: "partial",
+			feedback: "The tutor could not structure feedback cleanly, but the ideal answer is shown below.",
+		};
+	}
+	const candidate = raw as Record<string, unknown>;
+	const assessment = safeString(candidate.assessment);
+	return {
+		assessment:
+			assessment === "good" || assessment === "partial" || assessment === "miss"
+				? assessment
+				: "partial",
+		feedback:
+			safeString(candidate.feedback) ||
+			"Your answer was compared with the ideal answer. Use the notes below to refine your understanding.",
+		gotRight: stringArray(candidate.gotRight),
+		missed: stringArray(candidate.missed),
+		nextFocus: safeString(candidate.nextFocus),
+	};
+}
+
+async function evaluateQuizAnswer(
+	ctx: ExtensionCommandContext,
+	card: QuizCard,
+	answer: string,
+	thinkingOverride?: QuizThinkingLevel,
+	signal?: AbortSignal,
+): Promise<QuizAnswerFeedback> {
+	if (!ctx.model) throw new Error("No active model selected");
+	const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
+	const reasoning = ctx.model.reasoning ? toReasoning(thinkingOverride ?? "off") : undefined;
+	const snippetText = card.snippet?.code
+		? `Evidence snippet (${card.snippet.path || card.snippet.title || "snippet"}):\n${card.snippet.code}`
+		: "No snippet provided.";
+	const prompt = [
+		`Question: ${card.question}`,
+		snippetText,
+		card.hint ? `Hint shown to user: ${card.hint}` : undefined,
+		card.whyMatters ? `Why this matters: ${card.whyMatters}` : undefined,
+		card.misconception ? `Common trap: ${card.misconception}` : undefined,
+		`Ideal answer: ${card.idealAnswer}`,
+		`User answer: ${answer}`,
+	].filter(Boolean).join("\n\n");
+
+	const response = await completeSimple(
+		ctx.model,
+		{
+			systemPrompt: ANSWER_FEEDBACK_SYSTEM_PROMPT,
+			messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }],
+		},
+		{
+			apiKey,
+			reasoning,
+			maxTokens: 1200,
+			signal,
+		},
+	);
+
+	const responseText = response.content
+		.filter((part): part is { type: "text"; text: string } => part.type === "text")
+		.map((part) => part.text)
+		.join("\n");
+
+	const { data, repaired } = parseJsonPayloadText(responseText, "answer-feedback");
+	if (repaired && ctx.hasUI) {
+		ctx.ui.notify("Answer feedback JSON was malformed; repaired automatically", "info");
+	}
+	return normalizeAnswerFeedback(data);
+}
+
+async function loadGlimpseModule(): Promise<any> {
+	if (!glimpseModulePromise) {
+		const packageJsonPath = require.resolve("glimpseui/package.json");
+		const moduleUrl = pathToFileURL(join(dirname(packageJsonPath), "src", "glimpse.mjs")).href;
+		glimpseModulePromise = import(moduleUrl);
+	}
+	return glimpseModulePromise;
+}
+
+function escapeHtml(text: string): string {
+	return text
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/\"/g, "&quot;")
+		.replace(/'/g, "&#39;");
+}
+
+function renderFeedbackList(title: string, items?: string[]): string {
+	if (!items || items.length === 0) return "";
+	return `
+		<div class="feedback-block">
+		  <div class="feedback-title">${escapeHtml(title)}</div>
+		  <ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
+		</div>
+	`;
+}
+
+function renderGlimpseQuizHtml(
+	packet: QuizPacket,
+	card: QuizCard,
+	index: number,
+	state: GlimpseQuizState,
+): string {
+	const snippetMeta = [card.snippet?.title, card.snippet?.path].filter(Boolean).join(" · ");
+	const lineRange =
+		typeof card.snippet?.startLine === "number" && typeof card.snippet?.endLine === "number"
+			? ` lines ${card.snippet.startLine}-${card.snippet.endLine}`
+			: "";
+	const snippetSection = card.snippet?.code
+		? `
+		<div class="section-label">Evidence${snippetMeta ? ` · ${escapeHtml(snippetMeta)}` : ""}${escapeHtml(lineRange)}</div>
+		<pre class="code"><code>${escapeHtml(card.snippet.code)}</code></pre>
+		`
+		: "";
+	const answer = state.draftAnswer ?? "";
+	const assessmentClass = state.feedback ? `assessment-${state.feedback.assessment}` : "";
+	const assessmentLabel = state.feedback
+		? state.feedback.assessment === "good"
+			? "Strong"
+			: state.feedback.assessment === "miss"
+				? "Missed core point"
+				: "Partial"
+		: "";
+
+	const questionActions = `
+		<div class="actions">
+		  <button class="primary" onclick="submitAnswer()">Submit answer</button>
+		  <button onclick="toggleHint()">${state.showHint ? "Hide hint" : "Show hint"}</button>
+		  <button onclick="revealAnswer()">Reveal</button>
+		  <button onclick="skipQuestion()">Skip</button>
+		  <button class="ghost" onclick="closeQuiz()">Close</button>
+		</div>
+	`;
+
+	const revealActions = `
+		<div class="actions">
+		  <button class="primary" onclick="nextQuestion()">${index < packet.cards.length ? "Next question" : "Finish"}</button>
+		  <button class="ghost" onclick="closeQuiz()">Close</button>
+		</div>
+	`;
+
+	return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Code Quiz</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7fb;
+  --panel: rgba(255,255,255,0.92);
+  --text: #19202a;
+  --muted: #637086;
+  --border: #d5dbe8;
+  --accent: #0b84a5;
+  --accent-strong: #076a84;
+  --warning: #c17d00;
+  --success: #0d7a3f;
+  --danger: #b42318;
+  --code-bg: #f0f3fa;
+  --shadow: 0 18px 50px rgba(12, 18, 28, 0.18);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #11151b;
+    --panel: rgba(28,32,39,0.94);
+    --text: #e9eef5;
+    --muted: #97a3b6;
+    --border: #394252;
+    --accent: #4cc9f0;
+    --accent-strong: #67d6f6;
+    --warning: #f0b64d;
+    --success: #47d68c;
+    --danger: #ff7b72;
+    --code-bg: #171c24;
+    --shadow: 0 18px 50px rgba(0, 0, 0, 0.35);
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: transparent; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif; color: var(--text); }
+body { padding: 18px; }
+.window {
+  background: var(--panel);
+  border: 2px solid var(--border);
+  border-radius: 18px;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(12px);
+  overflow: hidden;
+}
+.header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(180deg, rgba(255,255,255,0.08), transparent);
+}
+.title { font-size: 13px; font-weight: 700; letter-spacing: 0.12em; color: var(--accent); text-transform: uppercase; }
+.meta { font-size: 13px; color: var(--muted); }
+.body { padding: 18px; display: grid; gap: 16px; }
+.scope { font-size: 13px; color: var(--muted); }
+.question { font-size: 22px; line-height: 1.35; font-weight: 600; }
+.section-label { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 8px; }
+.code {
+  margin: 0;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 14px;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-size: 13px;
+  line-height: 1.45;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+textarea {
+  width: 100%;
+  min-height: 150px;
+  resize: vertical;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: rgba(255,255,255,0.72);
+  color: var(--text);
+  padding: 14px;
+  font: inherit;
+  line-height: 1.45;
+}
+@media (prefers-color-scheme: dark) {
+  textarea { background: rgba(10, 12, 16, 0.55); }
+}
+textarea:focus { outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent); outline-offset: 2px; }
+.actions { display: flex; flex-wrap: wrap; gap: 10px; }
+button {
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  padding: 10px 16px;
+  font: inherit;
+  cursor: pointer;
+}
+button.primary { background: var(--accent); color: white; border-color: var(--accent); }
+button.primary:hover { background: var(--accent-strong); border-color: var(--accent-strong); }
+button.ghost { color: var(--muted); }
+button:hover { border-color: var(--accent); }
+.hint, .feedback-card, .answer-card {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 14px;
+  background: rgba(255,255,255,0.48);
+}
+@media (prefers-color-scheme: dark) {
+  .hint, .feedback-card, .answer-card { background: rgba(255,255,255,0.03); }
+}
+.feedback-card.assessment-good { border-color: color-mix(in srgb, var(--success) 45%, var(--border)); }
+.feedback-card.assessment-partial { border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
+.feedback-card.assessment-miss { border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
+.assessment {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.assessment strong { color: var(--text); }
+.feedback-title { font-size: 13px; font-weight: 700; color: var(--muted); margin-bottom: 6px; }
+.feedback-block ul { margin: 8px 0 0 18px; padding: 0; }
+.footer-note { font-size: 12px; color: var(--muted); }
+.loading {
+  display: grid;
+  gap: 12px;
+  place-items: start;
+  min-height: 220px;
+  align-content: center;
+}
+.spinner {
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  border: 3px solid color-mix(in srgb, var(--accent) 22%, transparent);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+  <div class="window">
+    <div class="header">
+      <div>
+        <div class="title">Code Quiz</div>
+        <div class="meta">Question ${index}/${packet.cards.length} · ${escapeHtml(card.lens)} · ${escapeHtml(card.depth)}</div>
+      </div>
+      <div class="meta">${escapeHtml(packet.scope.label)}</div>
+    </div>
+    <div class="body">
+      ${state.stage === "loading" || state.stage === "evaluating" ? `
+        <div class="loading">
+          <div class="spinner"></div>
+          <div class="question">${escapeHtml(state.stage === "loading" ? "Generating your quiz…" : "Evaluating your answer…")}</div>
+          <div class="footer-note">${escapeHtml(state.stage === "loading" ? "Preparing a gentle, code-anchored set of questions." : "Comparing your answer with the ideal answer.")}</div>
+        </div>
+        <div class="actions"><button class="ghost" onclick="closeQuiz()">Close</button></div>
+      ` : `
+        <div class="scope">${escapeHtml(packet.sourceSummary)}</div>
+        ${snippetSection}
+        <div>
+          <div class="section-label">Question</div>
+          <div class="question">${escapeHtml(card.question)}</div>
+        </div>
+        ${state.stage === "question" ? `
+          <div>
+            <div class="section-label">Your answer</div>
+            <textarea id="answer" placeholder="Write your best explanation here…">${escapeHtml(answer)}</textarea>
+          </div>
+          ${state.showHint && card.hint ? `<div class="hint"><div class="section-label">Hint</div>${escapeHtml(card.hint)}</div>` : ""}
+          ${questionActions}
+          <div class="footer-note">⌘/Ctrl+Enter submits · Esc closes</div>
+        ` : `
+          <div class="answer-card">
+            <div class="section-label">Your answer</div>
+            <div>${answer ? escapeHtml(answer).replace(/\n/g, "<br>") : "<em>No answer recorded.</em>"}</div>
+          </div>
+          <div class="feedback-card ${assessmentClass}">
+            ${state.feedback ? `<div class="assessment"><strong>${escapeHtml(assessmentLabel)}</strong></div>` : ""}
+            <div class="section-label">Tutor feedback</div>
+            <div>${escapeHtml(state.feedback?.feedback || "No evaluation provided.").replace(/\n/g, "<br>")}</div>
+            ${renderFeedbackList("What you got right", state.feedback?.gotRight)}
+            ${renderFeedbackList("What to tighten up", state.feedback?.missed)}
+            ${state.feedback?.nextFocus ? `<div class="feedback-block"><div class="feedback-title">Next focus</div><div>${escapeHtml(state.feedback.nextFocus)}</div></div>` : ""}
+          </div>
+          <div class="answer-card">
+            <div class="section-label">Ideal answer</div>
+            <div>${escapeHtml(card.idealAnswer).replace(/\n/g, "<br>")}</div>
+          </div>
+          ${card.whyMatters ? `<div class="answer-card"><div class="section-label">Why this matters</div><div>${escapeHtml(card.whyMatters)}</div></div>` : ""}
+          ${revealActions}
+        `}
+      `}
+    </div>
+  </div>
+<script>
+  const answerEl = () => document.getElementById('answer');
+  function currentAnswer() { return answerEl() ? answerEl().value : ${JSON.stringify(answer)}; }
+  function send(payload) { window.glimpse.send(payload); }
+  function submitAnswer() { send({ type: 'submit', answer: currentAnswer() }); }
+  function revealAnswer() { send({ type: 'reveal', answer: currentAnswer() }); }
+  function toggleHint() { send({ type: 'toggle-hint', answer: currentAnswer() }); }
+  function skipQuestion() { send({ type: 'skip' }); }
+  function nextQuestion() { send({ type: 'next' }); }
+  function closeQuiz() { send({ type: 'close' }); }
+  document.addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); submitAnswer(); }
+    if (e.key === 'Escape') { e.preventDefault(); closeQuiz(); }
+  });
+  if (answerEl()) answerEl().focus();
+</script>
+</body>
+</html>`;
+}
+
+async function runGlimpseQuiz(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	packet: QuizPacket,
+	thinkingOverride?: QuizThinkingLevel,
+): Promise<QuizRunRecord> {
+	const { open } = await loadGlimpseModule();
+	return await new Promise<QuizRunRecord>((resolve, reject) => {
+		const answers: QuizRunAnswer[] = [];
+		let finished = false;
+		let index = 0;
+		let state: GlimpseQuizState = { stage: "question", draftAnswer: "", showHint: false };
+		let currentRecord: QuizRunAnswer | null = null;
+		let currentPersisted = false;
+		const evaluationAbort = new AbortController();
+		const card = () => packet.cards[index]!;
+		const persistCurrentRecord = () => {
+			if (currentRecord && !currentPersisted) {
+				answers.push(currentRecord);
+				currentPersisted = true;
+			}
+		};
+		const resetQuestionState = () => {
+			state = { stage: "question", draftAnswer: "", showHint: false };
+			currentRecord = null;
+			currentPersisted = false;
+		};
+		const windowHandle = open(renderGlimpseQuizHtml(packet, card(), index + 1, state), {
+			width: 920,
+			height: 860,
+			title: `Code Quiz · ${packet.scope.label}`,
+			floating: true,
+			openLinks: true,
+		});
+
+		const rerender = () => {
+			windowHandle.setHTML(renderGlimpseQuizHtml(packet, card(), index + 1, state));
+		};
+
+		const finish = (quitEarly: boolean) => {
+			if (finished) return;
+			finished = true;
+			evaluationAbort.abort();
+			activeQuizClose = null;
+			resolve({
+				completedAt: new Date().toISOString(),
+				quitEarly,
+				answers,
+				packet,
+			});
+		};
+
+		activeQuizClose = () => {
+			persistCurrentRecord();
+			windowHandle.close();
+		};
+
+		windowHandle.on("message", async (message: unknown) => {
+			if (finished || !message || typeof message !== "object") return;
+			const payload = message as { type?: string; answer?: unknown };
+			const answer = typeof payload.answer === "string" ? payload.answer : state.draftAnswer || "";
+			switch (payload.type) {
+				case "toggle-hint":
+					state = { ...state, draftAnswer: answer, showHint: !state.showHint };
+					rerender();
+					return;
+				case "skip":
+					answers.push({ cardId: card().id, skipped: true, viewedHint: Boolean(state.showHint) });
+					if (index >= packet.cards.length - 1) {
+						windowHandle.close();
+					} else {
+						index++;
+						resetQuestionState();
+						rerender();
+					}
+					return;
+				case "reveal":
+					state = { stage: "reveal", draftAnswer: answer, showHint: Boolean(state.showHint) };
+					currentRecord = { cardId: card().id, answer: safeString(answer), viewedHint: Boolean(state.showHint) };
+					currentPersisted = false;
+					rerender();
+					return;
+				case "submit": {
+					state = { stage: "evaluating", draftAnswer: answer, showHint: Boolean(state.showHint) };
+					currentRecord = { cardId: card().id, answer: safeString(answer), viewedHint: Boolean(state.showHint) };
+					currentPersisted = false;
+					rerender();
+					try {
+						const feedback = await evaluateQuizAnswer(ctx, card(), answer, thinkingOverride, evaluationAbort.signal);
+						state = {
+							stage: "reveal",
+							draftAnswer: answer,
+							showHint: Boolean(state.showHint),
+							feedback,
+						};
+						rerender();
+					} catch (error) {
+						if (!finished) {
+							state = {
+								stage: "reveal",
+								draftAnswer: answer,
+								showHint: Boolean(state.showHint),
+								feedback: {
+									assessment: "partial",
+									feedback:
+										error instanceof Error
+											? `Could not evaluate the answer cleanly: ${error.message}`
+											: "Could not evaluate the answer cleanly.",
+								},
+							};
+							rerender();
+						}
+					}
+					return;
+				}
+				case "next":
+					persistCurrentRecord();
+					if (index >= packet.cards.length - 1) {
+						windowHandle.close();
+					} else {
+						index++;
+						resetQuestionState();
+						rerender();
+					}
+					return;
+				case "close":
+					persistCurrentRecord();
+					windowHandle.close();
+					return;
+			}
+		});
+
+		windowHandle.on("closed", () => {
+			persistCurrentRecord();
+			finish(answers.length < packet.cards.length);
+		});
+	});
 }
 
 abstract class CachedOverlayPanel {
@@ -1483,12 +2035,65 @@ async function runQuiz(packet: QuizPacket, ctx: ExtensionCommandContext): Promis
 	};
 }
 
+async function generatePacketWithOverlay(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	scope: ResolvedScope,
+	sources: SourceItem[],
+	thinkingLevel?: QuizThinkingLevel,
+): Promise<{ packet?: QuizPacket; error?: string }> {
+	const effectiveThinkingLevel = thinkingLevel ?? pi.getThinkingLevel();
+	let generationError: string | undefined;
+	let handleRef: OverlayHandle | null = null;
+	const generationAbort = new AbortController();
+	const packet = await ctx.ui.custom<QuizPacket | null>(
+		(_tui, theme, _kb, done) => {
+			const thinkingLabel = ctx.model?.reasoning ? ` · thinking ${effectiveThinkingLevel}` : "";
+			activeQuizClose = () => {
+				generationAbort.abort();
+				done(null);
+			};
+
+			generateQuizPacket(pi, ctx, scope, sources, generationAbort.signal, thinkingLevel)
+				.then(done)
+				.catch((err) => {
+					generationError = err instanceof Error ? err.message : String(err);
+					done(null);
+				});
+
+			return new QuizLoadingPanel(
+				theme,
+				`Generating quiz with ${ctx.model?.id || "current model"}${thinkingLabel} for ${scope.label}...`,
+				() => {
+					generationAbort.abort();
+					done(null);
+				},
+			);
+		},
+		{
+			overlay: true,
+			overlayOptions: QUIZ_LOADER_OVERLAY_OPTIONS,
+			onHandle: (handle) => {
+				handleRef = handle;
+				activeQuizOverlayHandle = handle;
+			},
+		},
+	);
+	if (activeQuizOverlayHandle === handleRef) activeQuizOverlayHandle = null;
+	activeQuizClose = null;
+	return packet ? { packet } : { error: generationError || "Quiz generation cancelled" };
+}
+
 export default function activeCodeTutor(pi: ExtensionAPI) {
 	pi.registerShortcut(Key.ctrlAlt("q"), {
 		description: "Focus or unfocus the active code quiz overlay",
 		handler: async (ctx) => {
 			if (!activeQuizOverlayHandle) {
-				ctx.ui.notify("No code quiz overlay is open", "info");
+				if (activeQuizClose) {
+					ctx.ui.notify("A native Glimpse quiz is open; focus that window directly", "info");
+				} else {
+					ctx.ui.notify("No code quiz overlay is open", "info");
+				}
 				return;
 			}
 			if (activeQuizOverlayHandle.isFocused()) {
@@ -1505,7 +2110,11 @@ export default function activeCodeTutor(pi: ExtensionAPI) {
 		description: "Focus or unfocus the active code quiz overlay",
 		handler: async (_args, ctx) => {
 			if (!activeQuizOverlayHandle) {
-				ctx.ui.notify("No code quiz overlay is open", "info");
+				if (activeQuizClose) {
+					ctx.ui.notify("A native Glimpse quiz is open; focus that window directly", "info");
+				} else {
+					ctx.ui.notify("No code quiz overlay is open", "info");
+				}
 				return;
 			}
 			if (activeQuizOverlayHandle.isFocused()) {
@@ -1556,48 +2165,9 @@ export default function activeCodeTutor(pi: ExtensionAPI) {
 				return;
 			}
 
-			const effectiveThinkingLevel = thinkingLevel ?? pi.getThinkingLevel();
-			let generationError: string | undefined;
-			let handleRef: OverlayHandle | null = null;
-			const generationAbort = new AbortController();
-			const packet = await ctx.ui.custom<QuizPacket | null>(
-				(_tui, theme, _kb, done) => {
-					const thinkingLabel = ctx.model!.reasoning ? ` · thinking ${effectiveThinkingLevel}` : "";
-					activeQuizClose = () => {
-						generationAbort.abort();
-						done(null);
-					};
-
-					generateQuizPacket(pi, ctx, scope, sources, generationAbort.signal, thinkingLevel)
-						.then(done)
-						.catch((err) => {
-							generationError = err instanceof Error ? err.message : String(err);
-							done(null);
-						});
-
-					return new QuizLoadingPanel(
-						theme,
-						`Generating quiz with ${ctx.model!.id}${thinkingLabel} for ${scope.label}...`,
-						() => {
-							generationAbort.abort();
-							done(null);
-						},
-					);
-				},
-				{
-					overlay: true,
-					overlayOptions: QUIZ_LOADER_OVERLAY_OPTIONS,
-					onHandle: (handle) => {
-						handleRef = handle;
-						activeQuizOverlayHandle = handle;
-					},
-				},
-			);
-			if (activeQuizOverlayHandle === handleRef) activeQuizOverlayHandle = null;
-			activeQuizClose = null;
-
+			const { packet, error: packetError } = await generatePacketWithOverlay(pi, ctx, scope, sources, thinkingLevel);
 			if (!packet) {
-				ctx.ui.notify(generationError || "Quiz generation cancelled", generationError ? "error" : "info");
+				ctx.ui.notify(packetError || "Quiz generation cancelled", packetError ? "error" : "info");
 				return;
 			}
 
@@ -1613,6 +2183,59 @@ export default function activeCodeTutor(pi: ExtensionAPI) {
 				? `Quiz stopped early · answered ${answered} · skipped ${skipped}`
 				: `Quiz complete · answered ${answered} · skipped ${skipped}`;
 			ctx.ui.notify(summary, "info");
+		},
+	});
+
+	pi.registerCommand("quiz-glimpse", {
+		description: "Open a native Glimpse window for a code quiz with richer answer/feedback interaction",
+		handler: async (args, ctx) => {
+			if (!ctx.hasUI) {
+				ctx.ui.notify("/quiz-glimpse requires interactive mode", "error");
+				return;
+			}
+			if (!ctx.model) {
+				ctx.ui.notify("No active model selected", "error");
+				return;
+			}
+
+			const cwd = process.cwd();
+			const repoRoot = getRepoRoot(cwd);
+			const { scope, thinkingLevel, error } = parseQuizCommandArgs(args || "", cwd, repoRoot);
+			if (!scope) {
+				ctx.ui.notify(error || "Failed to resolve quiz scope", "error");
+				return;
+			}
+
+			const sources = gatherSources(scope, ctx, cwd, repoRoot);
+			if (sources.length === 0) {
+				ctx.ui.notify(`No usable sources found for ${scope.label}`, "warning");
+				return;
+			}
+
+			const { packet, error: packetError } = await generatePacketWithOverlay(pi, ctx, scope, sources, thinkingLevel);
+			if (!packet) {
+				ctx.ui.notify(packetError || "Quiz generation cancelled", packetError ? "error" : "info");
+				return;
+			}
+
+			pi.appendEntry("code-quiz.packet", packet);
+			ctx.ui.notify(`Opening Glimpse quiz for ${packet.scope.label}...`, "info");
+
+			try {
+				const run = await runGlimpseQuiz(pi, ctx, packet, thinkingLevel);
+				pi.appendEntry("code-quiz.run", run);
+				const answered = run.answers.filter((answer) => !answer.skipped).length;
+				const skipped = run.answers.filter((answer) => answer.skipped).length;
+				const summary = run.quitEarly
+					? `Glimpse quiz stopped early · answered ${answered} · skipped ${skipped}`
+					: `Glimpse quiz complete · answered ${answered} · skipped ${skipped}`;
+				ctx.ui.notify(summary, "info");
+			} catch (glimpseError) {
+				ctx.ui.notify(
+					glimpseError instanceof Error ? `Failed to open Glimpse quiz: ${glimpseError.message}` : "Failed to open Glimpse quiz",
+					"error",
+				);
+			}
 		},
 	});
 }
