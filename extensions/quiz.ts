@@ -1786,7 +1786,7 @@ body { padding: 18px; }
 .meta { font-size: 13px; color: var(--muted); }
 .body { padding: 18px; display: grid; gap: 16px; }
 .scope { font-size: 13px; color: var(--muted); }
-.question { font-size: 22px; line-height: 1.35; font-weight: 600; }
+.question { font-size: 20px; line-height: 1.4; font-weight: 600; }
 .section-label { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 8px; }
 .code {
   margin: 0;
