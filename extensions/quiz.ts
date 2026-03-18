@@ -5,9 +5,7 @@ import { jsonrepair } from "jsonrepair";
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { createRequire } from "node:module";
-import { basename, dirname, extname, join, relative, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { basename, extname, join, relative, resolve } from "node:path";
 
 type ScopeKind = "workset" | "session" | "repo" | "file";
 type SourceKind = "conversation" | "file" | "readme" | "manifest" | "tree";
@@ -130,7 +128,6 @@ interface ParsedQuizCommandArgs {
 let activeQuizOverlayHandle: OverlayHandle | null = null;
 let activeQuizClose: (() => void) | null = null;
 
-const require = createRequire(import.meta.url);
 let glimpseModulePromise: Promise<any> | null = null;
 
 const MAX_CONVERSATION_MESSAGES = 8;
@@ -1259,9 +1256,7 @@ async function evaluateQuizAnswer(
 
 async function loadGlimpseModule(): Promise<any> {
 	if (!glimpseModulePromise) {
-		const packageJsonPath = require.resolve("glimpseui/package.json");
-		const moduleUrl = pathToFileURL(join(dirname(packageJsonPath), "src", "glimpse.mjs")).href;
-		glimpseModulePromise = import(moduleUrl);
+		glimpseModulePromise = import("glimpseui");
 	}
 	return glimpseModulePromise;
 }
