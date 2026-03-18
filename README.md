@@ -10,7 +10,7 @@ Instead of summarizing code for you, `pi-code-quiz` shows a real snippet, asks a
 
 ## What it does
 
-- Opens a Glimpse quiz window with a code snippet, question, and answer box
+- Opens a Glimpse quiz window on macOS with a code snippet, question, and answer box
 - Builds quizzes from the current `workset` (inferred active files), `session`, `repo`, or a specific file
 - Uses pi's active model; thinking level defaults to current but can be set
 - Keeps questions anchored to visible code snippets
@@ -43,22 +43,22 @@ Instead of summarizing code for you, `pi-code-quiz` shows a real snippet, asks a
 
 ## Install
 
-From a local checkout:
-
-```bash
-pi install /absolute/path/to/pi-code-quiz
-```
-
-From GitHub (if you have access to the repo):
+From GitHub:
 
 ```bash
 pi install https://github.com/omaclaren/pi-code-quiz
 ```
 
+From npm (coming soon):
+
+```bash
+pi install npm:pi-code-quiz
+```
+
 Try it without installing:
 
 ```bash
-pi -e /absolute/path/to/pi-code-quiz
+pi -e https://github.com/omaclaren/pi-code-quiz
 ```
 
 After installing, reload or restart pi.
@@ -70,7 +70,7 @@ After installing, reload or restart pi.
 - After feedback is shown, you can open a short **Discuss further** thread for that card.
 - After a set is finished, you can generate more questions from the same scope.
 - Quiz packets and quiz runs are stored as hidden session entries.
-- The current UI uses a Glimpse window. This version has mainly been tested on macOS.
+- The current UI uses a Glimpse window on macOS.
 
 ## License
 
