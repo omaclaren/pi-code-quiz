@@ -12,7 +12,7 @@ Instead of summarizing code for you, `pi-code-quiz` shows a real snippet, asks a
 
 - Opens a [Glimpse](https://github.com/hazat/glimpse) quiz window with a code snippet, question, and answer box
 - Builds quizzes from the current `workset` (inferred active files), `session`, `repo`, or a specific file
-- Uses pi's active model; thinking level defaults to the current setting but can be overridden
+- Uses pi's active model; thinking level defaults to the current setting, capped at `high`, but can be overridden
 - Keeps questions anchored to visible code snippets
 - Gives short feedback plus an ideal answer after you submit
 - Lets you open a per-question discussion thread
@@ -26,7 +26,7 @@ Instead of summarizing code for you, `pi-code-quiz` shows a real snippet, asks a
 - `/quiz repo` — quiz repo-level structure and central code
 - `/quiz file <path>` — quiz a specific file
 - `/quiz <path>` — shorthand for `/quiz file <path>` when the path exists
-- `/quiz ... --thinking off|minimal|low|medium|high|xhigh` — override the model thinking level
+- `/quiz ... --thinking off|minimal|low|medium|high` — override the model thinking level
 - `/quiz ... --audience general|scientist|developer` — bias the question style for a particular audience
 - `/quiz ... --mode gen|sci|dev` — short alias for `--audience`
 - `/quiz-close` — close the active quiz window

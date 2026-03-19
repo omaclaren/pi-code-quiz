@@ -144,10 +144,11 @@ interface GlimpseQuizLaunchResult {
 }
 
 type QuizThinkingLevel = "off" | ThinkingLevel;
+type QuizRequestedThinkingLevel = Exclude<QuizThinkingLevel, "xhigh">;
 
 interface ParsedQuizCommandArgs {
 	scope?: ResolvedScope;
-	thinkingLevel?: QuizThinkingLevel;
+	thinkingLevel?: QuizRequestedThinkingLevel;
 	audience: QuizAudience;
 	error?: string;
 }
@@ -282,7 +283,7 @@ const USAGE = [
 	"/quiz file src/foo.ts --audience developer --thinking low",
 ].join("\n");
 
-const QUIZ_THINKING_LEVELS: QuizThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+const QUIZ_THINKING_LEVELS: QuizRequestedThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
 const DEFAULT_QUIZ_AUDIENCE: QuizAudience = "general";
 const QUIZ_GENERATION_MAX_ATTEMPTS = 3;
 const QUIZ_AUDIENCE_ALIASES: Record<string, QuizAudience> = {
@@ -385,7 +386,16 @@ function withResponsesJsonSchemaFormat(
 	};
 }
 
-function toReasoning(level: QuizThinkingLevel): ThinkingLevel | undefined {
+function clampQuizThinking(level: QuizThinkingLevel): QuizRequestedThinkingLevel {
+	return level === "xhigh" ? "high" : level;
+}
+
+function resolveQuizThinkingLevel(pi: ExtensionAPI, thinkingOverride?: QuizRequestedThinkingLevel): QuizRequestedThinkingLevel {
+	if (thinkingOverride) return thinkingOverride;
+	return clampQuizThinking(pi.getThinkingLevel() as QuizThinkingLevel);
+}
+
+function toReasoning(level: QuizRequestedThinkingLevel): ThinkingLevel | undefined {
 	return level === "off" ? undefined : level;
 }
 
@@ -972,8 +982,8 @@ function gatherSources(scope: ResolvedScope, ctx: ExtensionCommandContext, cwd: 
 	return sources;
 }
 
-function isQuizThinkingLevel(value: string): value is QuizThinkingLevel {
-	return QUIZ_THINKING_LEVELS.includes(value as QuizThinkingLevel);
+function isQuizThinkingLevel(value: string): value is QuizRequestedThinkingLevel {
+	return QUIZ_THINKING_LEVELS.includes(value as QuizRequestedThinkingLevel);
 }
 
 function normalizeQuizAudience(value: string): QuizAudience | undefined {
@@ -1017,12 +1027,12 @@ function audiencePromptGuidance(audience: QuizAudience): string[] {
 
 function parseQuizCommandArgs(args: string, cwd: string, repoRoot: string): ParsedQuizCommandArgs {
 	let remaining = args.trim();
-	let thinkingLevel: QuizThinkingLevel | undefined;
+	let thinkingLevel: QuizRequestedThinkingLevel | undefined;
 	let audience = DEFAULT_QUIZ_AUDIENCE;
 
-	const explicitMatch = /(?:^|\s)--thinking\s+(off|minimal|low|medium|high|xhigh)(?=\s|$)/i.exec(remaining);
+	const explicitMatch = /(?:^|\s)--thinking\s+(off|minimal|low|medium|high)(?=\s|$)/i.exec(remaining);
 	if (explicitMatch) {
-		thinkingLevel = explicitMatch[1]!.toLowerCase() as QuizThinkingLevel;
+		thinkingLevel = explicitMatch[1]!.toLowerCase() as QuizRequestedThinkingLevel;
 		remaining = `${remaining.slice(0, explicitMatch.index)} ${remaining.slice(explicitMatch.index + explicitMatch[0].length)}`.trim();
 	} else {
 		const malformedThinking = /(?:^|\s)--thinking(?:\s+(\S+))?/i.exec(remaining);
@@ -1036,9 +1046,9 @@ function parseQuizCommandArgs(args: string, cwd: string, repoRoot: string): Pars
 	}
 
 	if (!thinkingLevel) {
-		const leadingThinking = /^(off|minimal|low|medium|high|xhigh)(?=\s|$)/i.exec(remaining);
+		const leadingThinking = /^(off|minimal|low|medium|high)(?=\s|$)/i.exec(remaining);
 		if (leadingThinking) {
-			thinkingLevel = leadingThinking[1]!.toLowerCase() as QuizThinkingLevel;
+			thinkingLevel = leadingThinking[1]!.toLowerCase() as QuizRequestedThinkingLevel;
 			remaining = remaining.slice(leadingThinking[0].length).trim();
 		}
 	}
@@ -1439,13 +1449,14 @@ async function generateQuizPacket(
 	sources: SourceItem[],
 	audience: QuizAudience,
 	signal: AbortSignal,
-	thinkingOverride?: QuizThinkingLevel,
+	thinkingOverride?: QuizRequestedThinkingLevel,
 	previousCards: QuizCard[] = [],
 ): Promise<QuizPacket> {
 	if (!ctx.model) throw new Error("No active model selected");
 	const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
 	const basePrompt = buildQuizPrompt(scope, sources, audience, previousCards);
-	const reasoning = ctx.model.reasoning ? toReasoning(thinkingOverride ?? pi.getThinkingLevel()) : undefined;
+	const effectiveThinkingLevel = resolveQuizThinkingLevel(pi, thinkingOverride);
+	const reasoning = ctx.model.reasoning ? toReasoning(effectiveThinkingLevel) : undefined;
 	let lastError: Error | undefined;
 	let retryMode: "normal" | "nudge-final-text" | "no-thinking" = "normal";
 
@@ -1602,7 +1613,7 @@ async function evaluateQuizAnswer(
 	card: QuizCard,
 	answer: string,
 	audience: QuizAudience,
-	thinkingOverride?: QuizThinkingLevel,
+	thinkingOverride?: QuizRequestedThinkingLevel,
 	signal?: AbortSignal,
 ): Promise<QuizAnswerFeedback> {
 	if (!ctx.model) throw new Error("No active model selected");
@@ -1712,7 +1723,7 @@ async function discussQuizCard(
 	feedback: QuizAnswerFeedback | undefined,
 	audience: QuizAudience,
 	thread: QuizDiscussionMessage[],
-	thinkingOverride?: QuizThinkingLevel,
+	thinkingOverride?: QuizRequestedThinkingLevel,
 	signal?: AbortSignal,
 ): Promise<string> {
 	if (!ctx.model) throw new Error("No active model selected");
@@ -2429,10 +2440,10 @@ async function runGlimpseQuizFlow(
 	scope: ResolvedScope,
 	sources: SourceItem[],
 	audience: QuizAudience,
-	thinkingOverride?: QuizThinkingLevel,
+	thinkingOverride?: QuizRequestedThinkingLevel,
 ): Promise<GlimpseQuizLaunchResult> {
 	const { open } = await loadGlimpseModule();
-	const effectiveThinkingLevel = thinkingOverride ?? pi.getThinkingLevel();
+	const effectiveThinkingLevel = resolveQuizThinkingLevel(pi, thinkingOverride);
 	const thinkingLabel = ctx.model?.reasoning ? ` · thinking ${effectiveThinkingLevel}` : "";
 	const audienceSuffix = audience === DEFAULT_QUIZ_AUDIENCE ? "" : ` · ${audienceLabel(audience)}`;
 	const loadingMessage = `Generating quiz with ${ctx.model?.id || "current model"}${thinkingLabel}${audienceSuffix}...`;
