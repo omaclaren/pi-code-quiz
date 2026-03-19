@@ -312,30 +312,37 @@ const QUIZ_PACKET_JSON_SCHEMA = {
 				type: "object",
 				additionalProperties: false,
 				properties: {
-					id: { type: "string" },
+					id: { type: ["string", "null"] },
 					question: { type: "string" },
-					lens: { type: "string", enum: ["abstraction", "usage", "mechanism", "assumption", "change", "debugging"] },
-					depth: { type: "string", enum: ["foundational", "intermediate", "subtle", "transfer"] },
-					sourceIds: { type: "array", items: { type: "string" } },
+					lens: {
+						type: ["string", "null"],
+						enum: ["abstraction", "usage", "mechanism", "assumption", "change", "debugging", null],
+					},
+					depth: {
+						type: ["string", "null"],
+						enum: ["foundational", "intermediate", "subtle", "transfer", null],
+					},
+					sourceIds: { type: ["array", "null"], items: { type: "string" } },
 					snippet: {
-						type: "object",
+						type: ["object", "null"],
 						additionalProperties: false,
 						properties: {
-							sourceId: { type: "string" },
-							title: { type: "string" },
-							path: { type: "string" },
-							startLine: { type: "integer" },
-							endLine: { type: "integer" },
-							language: { type: "string" },
-							code: { type: "string" },
+							sourceId: { type: ["string", "null"] },
+							title: { type: ["string", "null"] },
+							path: { type: ["string", "null"] },
+							startLine: { type: ["integer", "null"] },
+							endLine: { type: ["integer", "null"] },
+							language: { type: ["string", "null"] },
+							code: { type: ["string", "null"] },
 						},
+						required: ["sourceId", "title", "path", "startLine", "endLine", "language", "code"],
 					},
-					hint: { type: "string" },
+					hint: { type: ["string", "null"] },
 					idealAnswer: { type: "string" },
-					whyMatters: { type: "string" },
-					misconception: { type: "string" },
+					whyMatters: { type: ["string", "null"] },
+					misconception: { type: ["string", "null"] },
 				},
-				required: ["question", "idealAnswer"],
+				required: ["id", "question", "lens", "depth", "sourceIds", "snippet", "hint", "idealAnswer", "whyMatters", "misconception"],
 			},
 		},
 	},
@@ -348,11 +355,11 @@ const ANSWER_FEEDBACK_JSON_SCHEMA = {
 	properties: {
 		assessment: { type: "string", enum: ["good", "partial", "miss"] },
 		feedback: { type: "string" },
-		gotRight: { type: "array", items: { type: "string" } },
-		missed: { type: "array", items: { type: "string" } },
-		nextFocus: { type: "string" },
+		gotRight: { type: ["array", "null"], items: { type: "string" } },
+		missed: { type: ["array", "null"], items: { type: "string" } },
+		nextFocus: { type: ["string", "null"] },
 	},
-	required: ["assessment", "feedback"],
+	required: ["assessment", "feedback", "gotRight", "missed", "nextFocus"],
 } as const;
 
 function hashText(text: string): string {
@@ -389,6 +396,10 @@ function withResponsesJsonSchemaFormat(
 			},
 		},
 	};
+}
+
+function isInvalidResponsesJsonSchemaError(message?: string): boolean {
+	return typeof message === "string" && /Invalid schema for response_format/i.test(message);
 }
 
 function clampQuizThinking(level: QuizThinkingLevel): QuizRequestedThinkingLevel {
@@ -1527,6 +1538,7 @@ async function generateQuizPacket(
 	const reasoning = ctx.model.reasoning ? toReasoning(effectiveThinkingLevel) : undefined;
 	let lastError: Error | undefined;
 	let retryMode: "normal" | "nudge-final-text" | "no-thinking" = "normal";
+	let useJsonSchema = shouldUseResponsesJsonSchema(ctx.model);
 
 	for (let attempt = 1; attempt <= QUIZ_GENERATION_MAX_ATTEMPTS; attempt++) {
 		const attemptReasoning = retryMode === "no-thinking" ? undefined : reasoning;
@@ -1556,7 +1568,7 @@ async function generateQuizPacket(
 				reasoning: attemptReasoning,
 				maxTokens: 5000,
 				signal,
-				onPayload: shouldUseResponsesJsonSchema(ctx.model)
+				onPayload: useJsonSchema
 					? async (payload) =>
 						withResponsesJsonSchemaFormat(
 							payload,
@@ -1599,6 +1611,13 @@ async function generateQuizPacket(
 			);
 			if (signal.aborted) throw lastError;
 			if (attempt < QUIZ_GENERATION_MAX_ATTEMPTS) {
+				if (useJsonSchema && isInvalidResponsesJsonSchemaError(response.errorMessage)) {
+					useJsonSchema = false;
+					if (ctx.hasUI) {
+						ctx.ui.notify("Quiz provider rejected the structured JSON schema; retrying without schema enforcement", "info");
+					}
+					continue;
+				}
 				if (isThinkingOnlyResponse(responseText, responsePartTypes) && attemptReasoning !== undefined) {
 					if (retryMode === "normal") {
 						retryMode = "nudge-final-text";
@@ -1687,6 +1706,7 @@ async function evaluateQuizAnswer(
 	if (!ctx.model) throw new Error("No active model selected");
 	const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
 	const reasoning = ctx.model.reasoning ? toReasoning(thinkingOverride ?? "off") : undefined;
+	let useJsonSchema = shouldUseResponsesJsonSchema(ctx.model);
 	const snippetText = card.snippet?.code
 		? `Evidence snippet (${card.snippet.path || card.snippet.title || "snippet"}):\n${card.snippet.code}`
 		: "No snippet provided.";
@@ -1712,7 +1732,7 @@ async function evaluateQuizAnswer(
 			reasoning,
 			maxTokens: 1200,
 			signal,
-			onPayload: shouldUseResponsesJsonSchema(ctx.model)
+			onPayload: useJsonSchema
 				? async (payload) =>
 					withResponsesJsonSchemaFormat(
 						payload,
@@ -1731,6 +1751,31 @@ async function evaluateQuizAnswer(
 		.filter((part): part is { type: "text"; text: string } => part.type === "text")
 		.map((part) => part.text)
 		.join("\n");
+	if (useJsonSchema && isInvalidResponsesJsonSchemaError(response.errorMessage)) {
+		useJsonSchema = false;
+		if (ctx.hasUI) ctx.ui.notify("Answer-feedback provider rejected the structured JSON schema; retrying without schema enforcement", "info");
+		response = await completeSimple(
+			ctx.model,
+			{
+				systemPrompt: ANSWER_FEEDBACK_SYSTEM_PROMPT,
+				messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }],
+			},
+			{
+				apiKey,
+				reasoning,
+				maxTokens: 1200,
+				signal,
+				onPayload: undefined,
+			},
+		);
+		responsePartTypes = response.content
+			.map((part) => (typeof part?.type === "string" ? part.type : "unknown"))
+			.filter((type, index, array) => array.indexOf(type) === index);
+		responseText = response.content
+			.filter((part): part is { type: "text"; text: string } => part.type === "text")
+			.map((part) => part.text)
+			.join("\n");
+	}
 	if (isThinkingOnlyResponse(responseText, responsePartTypes) && reasoning !== undefined) {
 		if (ctx.hasUI) ctx.ui.notify("Answer feedback model returned thinking without final text; retrying with thinking off", "info");
 		response = await completeSimple(
@@ -1744,7 +1789,7 @@ async function evaluateQuizAnswer(
 				reasoning: undefined,
 				maxTokens: 1200,
 				signal,
-				onPayload: shouldUseResponsesJsonSchema(ctx.model)
+				onPayload: useJsonSchema
 					? async (payload) =>
 						withResponsesJsonSchemaFormat(
 							payload,
