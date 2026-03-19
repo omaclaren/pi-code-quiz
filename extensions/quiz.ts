@@ -1152,6 +1152,32 @@ function extractJsonPayload(text: string): string {
 	throw new Error("Model did not return JSON");
 }
 
+function compactPreview(text: string, max = 320): string {
+	const compact = text.replace(/\s+/g, " ").trim();
+	if (!compact) return "[empty text response]";
+	return compact.length <= max ? compact : `${compact.slice(0, max - 1)}…`;
+}
+
+function formatQuizParseError(
+	error: Error,
+	responseText: string,
+	responsePartTypes: string[],
+	modelLabel: string,
+	scopeLabel: string,
+	attempt: number,
+): Error {
+	const typesLabel = responsePartTypes.length > 0 ? responsePartTypes.join(", ") : "none";
+	const preview = compactPreview(responseText);
+	return new Error(
+		[
+			`Quiz generation failed for ${modelLabel} on ${scopeLabel} (attempt ${attempt}).`,
+			`Parse error: ${error.message}`,
+			`Response part types: ${typesLabel}`,
+			`Raw response preview: ${preview}`,
+		].join("\n"),
+	);
+}
+
 function parseJsonPayloadText(text: string, label: string): { data: unknown; repaired: boolean } {
 	const payload = extractJsonPayload(text);
 	try {
@@ -1349,6 +1375,9 @@ async function generateQuizPacket(
 			},
 		);
 
+		const responsePartTypes = response.content
+			.map((part) => (typeof part?.type === "string" ? part.type : "unknown"))
+			.filter((type, index, array) => array.indexOf(type) === index);
 		const responseText = response.content
 			.filter((part): part is { type: "text"; text: string } => part.type === "text")
 			.map((part) => part.text)
@@ -1364,10 +1393,18 @@ async function generateQuizPacket(
 			}
 			return normalizePacket(data, scope, sources, audience);
 		} catch (error) {
-			lastError = error instanceof Error ? error : new Error(String(error));
+			const parseError = error instanceof Error ? error : new Error(String(error));
+			lastError = formatQuizParseError(
+				parseError,
+				responseText,
+				responsePartTypes,
+				ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown model",
+				scope.label,
+				attempt,
+			);
 			if (signal.aborted) throw lastError;
 			if (attempt < QUIZ_GENERATION_MAX_ATTEMPTS && ctx.hasUI) {
-				ctx.ui.notify("Quiz JSON was malformed; retrying once", "info");
+				ctx.ui.notify(`Quiz generation parse failed: ${parseError.message}; retrying once`, "info");
 				continue;
 			}
 		}
