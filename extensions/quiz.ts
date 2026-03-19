@@ -357,6 +357,10 @@ function isResponsesApiModel(api: string): boolean {
 	return api === "openai-responses" || api === "azure-openai-responses" || api === "openai-codex-responses";
 }
 
+function shouldUseResponsesJsonSchema(model: { api: string; provider?: string }): boolean {
+	return isResponsesApiModel(model.api) && model.provider !== "github-copilot";
+}
+
 function withResponsesJsonSchemaFormat(
 	payload: unknown,
 	name: string,
@@ -1250,6 +1254,8 @@ function formatQuizParseError(
 	modelLabel: string,
 	scopeLabel: string,
 	attempt: number,
+	responseStopReason?: string,
+	responseErrorMessage?: string,
 ): Error {
 	const typesLabel = responsePartTypes.length > 0 ? responsePartTypes.join(", ") : "none";
 	const preview = compactPreview(responseText);
@@ -1257,9 +1263,13 @@ function formatQuizParseError(
 		[
 			`Quiz generation failed for ${modelLabel} on ${scopeLabel} (attempt ${attempt}).`,
 			`Parse error: ${error.message}`,
+			responseStopReason ? `Response stop reason: ${responseStopReason}` : undefined,
+			responseErrorMessage ? `Response error message: ${responseErrorMessage}` : undefined,
 			`Response part types: ${typesLabel}`,
 			`Raw response preview: ${preview}`,
-		].join("\n"),
+		]
+			.filter(Boolean)
+			.join("\n"),
 	);
 }
 
@@ -1465,7 +1475,7 @@ async function generateQuizPacket(
 				reasoning: attemptReasoning,
 				maxTokens: 5000,
 				signal,
-				onPayload: isResponsesApiModel(ctx.model.api)
+				onPayload: shouldUseResponsesJsonSchema(ctx.model)
 					? async (payload) =>
 						withResponsesJsonSchemaFormat(
 							payload,
@@ -1503,6 +1513,8 @@ async function generateQuizPacket(
 				ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown model",
 				scope.label,
 				attempt,
+				response.stopReason,
+				response.errorMessage,
 			);
 			if (signal.aborted) throw lastError;
 			if (attempt < QUIZ_GENERATION_MAX_ATTEMPTS) {
@@ -1612,7 +1624,7 @@ async function evaluateQuizAnswer(
 			reasoning,
 			maxTokens: 1200,
 			signal,
-			onPayload: isResponsesApiModel(ctx.model.api)
+			onPayload: shouldUseResponsesJsonSchema(ctx.model)
 				? async (payload) =>
 					withResponsesJsonSchemaFormat(
 						payload,
@@ -1644,7 +1656,7 @@ async function evaluateQuizAnswer(
 				reasoning: undefined,
 				maxTokens: 1200,
 				signal,
-				onPayload: isResponsesApiModel(ctx.model.api)
+				onPayload: shouldUseResponsesJsonSchema(ctx.model)
 					? async (payload) =>
 						withResponsesJsonSchemaFormat(
 							payload,
