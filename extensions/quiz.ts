@@ -261,6 +261,8 @@ Avoid:
 
 Output requirements:
 - Return STRICT JSON only.
+- Emit one final assistant text response containing only the JSON object.
+- Do not stop after reasoning content or reasoning summary.
 - Do not use markdown fences.
 - Keep snippets short: ideally <= 20 lines.
 - If you include snippet code, copy it from the provided sources rather than inventing it.
@@ -292,8 +294,91 @@ const QUIZ_AUDIENCE_ALIASES: Record<string, QuizAudience> = {
 	dev: "developer",
 };
 
+const QUIZ_PACKET_JSON_SCHEMA = {
+	type: "object",
+	additionalProperties: false,
+	properties: {
+		sourceSummary: { type: "string" },
+		cards: {
+			type: "array",
+			minItems: 1,
+			items: {
+				type: "object",
+				additionalProperties: false,
+				properties: {
+					id: { type: "string" },
+					question: { type: "string" },
+					lens: { type: "string", enum: ["abstraction", "usage", "mechanism", "assumption", "change", "debugging"] },
+					depth: { type: "string", enum: ["foundational", "intermediate", "subtle", "transfer"] },
+					sourceIds: { type: "array", items: { type: "string" } },
+					snippet: {
+						type: "object",
+						additionalProperties: false,
+						properties: {
+							sourceId: { type: "string" },
+							title: { type: "string" },
+							path: { type: "string" },
+							startLine: { type: "integer" },
+							endLine: { type: "integer" },
+							language: { type: "string" },
+							code: { type: "string" },
+						},
+					},
+					hint: { type: "string" },
+					idealAnswer: { type: "string" },
+					whyMatters: { type: "string" },
+					misconception: { type: "string" },
+				},
+				required: ["question", "idealAnswer"],
+			},
+		},
+	},
+	required: ["sourceSummary", "cards"],
+} as const;
+
+const ANSWER_FEEDBACK_JSON_SCHEMA = {
+	type: "object",
+	additionalProperties: false,
+	properties: {
+		assessment: { type: "string", enum: ["good", "partial", "miss"] },
+		feedback: { type: "string" },
+		gotRight: { type: "array", items: { type: "string" } },
+		missed: { type: "array", items: { type: "string" } },
+		nextFocus: { type: "string" },
+	},
+	required: ["assessment", "feedback"],
+} as const;
+
 function hashText(text: string): string {
 	return createHash("sha256").update(text).digest("hex").slice(0, 16);
+}
+
+function isResponsesApiModel(api: string): boolean {
+	return api === "openai-responses" || api === "azure-openai-responses" || api === "openai-codex-responses";
+}
+
+function withResponsesJsonSchemaFormat(
+	payload: unknown,
+	name: string,
+	schema: Record<string, unknown>,
+	description: string,
+): unknown {
+	if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
+	const record = payload as Record<string, unknown>;
+	const existingText = record.text && typeof record.text === "object" && !Array.isArray(record.text) ? (record.text as Record<string, unknown>) : {};
+	return {
+		...record,
+		text: {
+			...existingText,
+			format: {
+				type: "json_schema",
+				name,
+				schema,
+				description,
+				strict: true,
+			},
+		},
+	};
 }
 
 function toReasoning(level: QuizThinkingLevel): ThinkingLevel | undefined {
@@ -1380,6 +1465,15 @@ async function generateQuizPacket(
 				reasoning: attemptReasoning,
 				maxTokens: 5000,
 				signal,
+				onPayload: isResponsesApiModel(ctx.model.api)
+					? async (payload) =>
+						withResponsesJsonSchemaFormat(
+							payload,
+							"code_quiz_packet",
+							QUIZ_PACKET_JSON_SCHEMA as unknown as Record<string, unknown>,
+							"A packet of active code-understanding quiz cards.",
+						)
+					: undefined,
 			},
 		);
 
@@ -1441,6 +1535,7 @@ Requirements:
 - Respect the intended audience profile when judging what counts as a good answer.
 - Do not nitpick wording if the conceptual understanding is correct.
 - Return STRICT JSON only.
+- Emit one final assistant text response containing only the JSON object.
 
 JSON shape:
 {
@@ -1517,6 +1612,15 @@ async function evaluateQuizAnswer(
 			reasoning,
 			maxTokens: 1200,
 			signal,
+			onPayload: isResponsesApiModel(ctx.model.api)
+				? async (payload) =>
+					withResponsesJsonSchemaFormat(
+						payload,
+						"code_quiz_answer_feedback",
+						ANSWER_FEEDBACK_JSON_SCHEMA as unknown as Record<string, unknown>,
+						"Brief structured feedback on a user's answer to a code quiz question.",
+					)
+				: undefined,
 		},
 	);
 
@@ -1540,6 +1644,15 @@ async function evaluateQuizAnswer(
 				reasoning: undefined,
 				maxTokens: 1200,
 				signal,
+				onPayload: isResponsesApiModel(ctx.model.api)
+					? async (payload) =>
+						withResponsesJsonSchemaFormat(
+							payload,
+							"code_quiz_answer_feedback",
+							ANSWER_FEEDBACK_JSON_SCHEMA as unknown as Record<string, unknown>,
+							"Brief structured feedback on a user's answer to a code quiz question.",
+						)
+					: undefined,
 			},
 		);
 		responsePartTypes = response.content
