@@ -4,14 +4,29 @@ import hljs from "highlight.js";
 import { jsonrepair } from "jsonrepair";
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { basename, extname, join, relative, resolve } from "node:path";
 
 type ScopeKind = "workset" | "session" | "repo" | "file";
 type SourceKind = "conversation" | "file" | "readme" | "manifest" | "tree";
 type Lens = "abstraction" | "usage" | "mechanism" | "assumption" | "change" | "debugging";
 type Depth = "foundational" | "intermediate" | "subtle" | "transfer";
-type QuizAudience = "general" | "scientist" | "developer";
+type QuizAudience = "general" | "scientist" | "developer" | "reviewer";
+
+const require = createRequire(import.meta.url);
+const MarkdownIt = require("markdown-it");
+const texmath = require("markdown-it-texmath");
+const katex = require("katex");
+const proseMarkdownRenderer = new MarkdownIt({ html: false, breaks: true, linkify: true }).use(texmath, {
+	engine: katex,
+	delimiters: ["brackets", "dollars", "beg_end"],
+	katexOptions: {
+		throwOnError: false,
+		strict: "ignore",
+		output: "mathml",
+	},
+});
 
 type SessionBranchEntry = {
 	type?: string;
@@ -49,6 +64,7 @@ interface SourceItem {
 	fingerprint: string;
 	path?: string;
 	language?: string;
+	extractionWarning?: string;
 }
 
 interface QuizCardSnippet {
@@ -92,6 +108,9 @@ interface QuizCompletionStats {
 	answered: number;
 	skipped: number;
 	questionSetsCompleted: number;
+	good: number;
+	partial: number;
+	miss: number;
 }
 
 interface QuizDiscussionMessage {
@@ -115,6 +134,7 @@ interface QuizRunRecord {
 	answers: QuizRunAnswer[];
 	packet: QuizPacket;
 	packets?: QuizPacket[];
+	wrapUp?: string;
 }
 
 interface QuizAnswerFeedback {
@@ -135,6 +155,10 @@ interface GlimpseQuizState {
 	discussionPending?: boolean;
 	discussionMessages?: QuizDiscussionMessage[];
 	completionStats?: QuizCompletionStats;
+	wrapUpText?: string;
+	wrapUpPending?: boolean;
+	wrapUpSavedPath?: string;
+	wrapUpSavePending?: boolean;
 }
 
 interface GlimpseQuizLaunchResult {
@@ -150,7 +174,14 @@ interface ParsedQuizCommandArgs {
 	scope?: ResolvedScope;
 	thinkingLevel?: QuizRequestedThinkingLevel;
 	audience: QuizAudience;
+	focus?: string;
 	error?: string;
+}
+
+interface GatherSourcesOptions {
+	broaden?: boolean;
+	focus?: string;
+	audience?: QuizAudience;
 }
 
 let activeQuizClose: (() => void) | null = null;
@@ -162,6 +193,9 @@ const MAX_TRACKED_FILES = 3;
 const MAX_FILE_LINES = 220;
 const MAX_FILE_BYTES = 40_000;
 const MAX_REPO_TREE_FILES = 200;
+const MAX_FOCUS_CANDIDATE_FILES = 8;
+const MAX_FOCUS_SELECTED_SOURCES = 5;
+const SOURCE_SELECTION_PREVIEW_CHARS = 900;
 const CARD_COUNT = 4;
 const CODE_PREVIEW_HEAD_LINES = 60;
 const CODE_PREVIEW_BLOCK_LINES = 18;
@@ -197,6 +231,15 @@ const CODE_FILE_EXTENSIONS = new Set([
 	".go",
 	".hs",
 	".sql",
+]);
+
+const DOCUMENT_FILE_EXTENSIONS = new Set([
+	".md",
+	".tex",
+	".pdf",
+	".docx",
+	".txt",
+	".rst",
 ]);
 
 const MANIFEST_FILE_NAMES = new Set([
@@ -235,19 +278,19 @@ const ROOT_MANIFEST_PRIORITY = [
 	"Makefile",
 ];
 
-const SYSTEM_PROMPT = `You are an active code-reading tutor that creates short, high-value quizzes.
+const SYSTEM_PROMPT = `You are an active understanding tutor that creates short, high-value quizzes.
 
 Audience and intent:
 - The user is often more scientist / applied mathematician / engineer than conventional software developer.
-- They want a tactile, operational feel for code: what is being represented, how it is used, how values move through the code, what assumptions matter, what changes under perturbation, and where the conceptual seams are.
-- They do NOT want generic software-process trivia unless it is truly central.
+- They want a tactile, operational feel for the material: what is being represented or claimed, how it is used, how values or ideas move through it, what assumptions matter, what changes under perturbation, and where the conceptual seams are.
+- They do NOT want generic process trivia unless it is truly central.
 
 Your job:
 - Create a short quiz that forces active engagement rather than passive recognition.
 - Ask questions that probe real understanding and push the user toward better mental models.
 - Use real source snippets as evidence when possible, but only in service of a question.
-- Prefer questions about abstraction, usage/interface, mechanism/flow, assumptions/invariants, change impact, and debugging/failure modes.
-- Phrase questions in plain, direct language, like a thoughtful supervisor checking whether someone really understands the code.
+- Prefer questions about abstraction, usage/interface, mechanism/flow, assumptions/invariants, change impact, debugging/failure modes, claims, methods, and evidence when appropriate.
+- Phrase questions in plain, direct language, like a thoughtful supervisor checking whether someone really understands the material.
 
 Style requirements for questions:
 - Prefer one clear conceptual probe per card.
@@ -274,18 +317,40 @@ Output requirements:
 - If you include snippet code, copy it from the provided sources rather than inventing it.
 `;
 
+const SOURCE_SELECTION_SYSTEM_PROMPT = `You are selecting the best local sources for a focused quiz.
+
+Requirements:
+- Choose a small, complementary subset of the candidate sources that best matches the user's stated focus.
+- Prefer sources that contain concrete evidence, definitions, mechanisms, claims, or results that can support a quiz.
+- Avoid redundant sources unless the user's focus explicitly asks for comparison or synthesis across multiple files/documents.
+- Conversation context, repo tree summaries, and readmes are allowed, but only select them if they genuinely help answer the focus.
+- For document-review tasks, selecting multiple documents is appropriate when the user asks for common themes or comparison.
+- Return STRICT JSON only.
+- Emit one final assistant text response containing only the JSON object.
+
+JSON shape:
+{
+  "selectedIds": ["s2", "s5"],
+  "rationale": "optional brief reason"
+}
+`;
+
 const USAGE = [
 	"/quiz",
 	"/quiz workset",
 	"/quiz session",
 	"/quiz repo",
 	"/quiz file <path>",
+	"/quiz --file <path>",
 	"/quiz <path-to-file>",
 	"/quiz repo --thinking off",
 	"/quiz file src/foo.ts --thinking low",
+	"/quiz --file src/foo.ts --audience developer --thinking low",
 	"/quiz repo --audience scientist",
 	"/quiz repo --mode sci",
-	"/quiz file src/foo.ts --audience developer --thinking low",
+	"/quiz file thesis.tex --focus \"the introduction and model formulation\"",
+	"/quiz --file paper.pdf --mode reviewer",
+	"/quiz --file chapter3.tex --mode rev --focus \"the assumptions\"",
 ].join("\n");
 
 const QUIZ_THINKING_LEVELS: QuizRequestedThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
@@ -298,6 +363,8 @@ const QUIZ_AUDIENCE_ALIASES: Record<string, QuizAudience> = {
 	sci: "scientist",
 	developer: "developer",
 	dev: "developer",
+	reviewer: "reviewer",
+	rev: "reviewer",
 };
 
 const QUIZ_PACKET_JSON_SCHEMA = {
@@ -360,6 +427,16 @@ const ANSWER_FEEDBACK_JSON_SCHEMA = {
 		nextFocus: { type: ["string", "null"] },
 	},
 	required: ["assessment", "feedback", "gotRight", "missed", "nextFocus"],
+} as const;
+
+const SOURCE_SELECTION_JSON_SCHEMA = {
+	type: "object",
+	additionalProperties: false,
+	properties: {
+		selectedIds: { type: "array", minItems: 1, items: { type: "string" } },
+		rationale: { type: ["string", "null"] },
+	},
+	required: ["selectedIds", "rationale"],
 } as const;
 
 function hashText(text: string): string {
@@ -428,6 +505,20 @@ function displayPath(path: string): string {
 	return path.split("\\").join("/");
 }
 
+function slugify(text: string, fallback = "quiz"): string {
+	const slug = text
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, 48);
+	return slug || fallback;
+}
+
+function timestampForFilename(date = new Date()): string {
+	const pad = (value: number) => String(value).padStart(2, "0");
+	return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}_${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
 function languageFromPath(path?: string): string | undefined {
 	if (!path) return undefined;
 	const ext = extname(path).toLowerCase();
@@ -443,6 +534,11 @@ function languageFromPath(path?: string): string | undefined {
 			".jl": "julia",
 			".r": "r",
 			".md": "md",
+			".tex": "latex",
+			".rst": "text",
+			".txt": "text",
+			".pdf": "text",
+			".docx": "text",
 			".json": "json",
 			".yaml": "yaml",
 			".yml": "yaml",
@@ -645,7 +741,7 @@ function isManifestLikePath(path: string): boolean {
 
 function isInterestingQuizFilePath(path: string): boolean {
 	const lower = path.toLowerCase();
-	return isLikelyCodeFile(path) || isManifestLikePath(path) || lower === "readme" || lower === "readme.md";
+	return isLikelyCodeFile(path) || isLikelyDocumentFile(path) || isManifestLikePath(path) || lower === "readme" || lower === "readme.md";
 }
 
 function resolveExistingFilePath(token: string, cwd: string, repoRoot: string): string | undefined {
@@ -847,15 +943,63 @@ function isProbablyText(content: string): boolean {
 	return !content.includes("\u0000");
 }
 
+function extractTextFromFile(absPath: string): { text: string; warning?: string } | undefined {
+	const ext = extname(absPath).toLowerCase();
+	if (ext === ".pdf") {
+		try {
+			const text = execSync(`pdftotext "${absPath}" -`, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 1024 * 1024 });
+			return {
+				text,
+				warning: "PDF text extracted automatically via pdftotext. If equations or tables look garbled, consider converting to .md or .tex first.",
+			};
+		} catch {
+			return undefined;
+		}
+	}
+	if (ext === ".docx") {
+		try {
+			const text = execSync(`pandoc -t plain "${absPath}"`, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 1024 * 1024 });
+			return {
+				text,
+				warning: "DOCX text extracted automatically via pandoc. If formatting looks garbled, consider converting to .md first.",
+			};
+		} catch {
+			return undefined;
+		}
+	}
+	return undefined;
+}
+
 function filePreview(absPath: string, repoRoot: string, maxLines = MAX_FILE_LINES): SourceItem | undefined {
 	try {
+		const relPath = displayPath(relative(repoRoot, absPath));
+		const ext = extname(relPath).toLowerCase();
+
+		if (isExternalExtractionFile(absPath)) {
+			const extracted = extractTextFromFile(absPath);
+			if (!extracted) return undefined;
+			let raw = extracted.text;
+			if (raw.length > MAX_FILE_BYTES) raw = raw.slice(0, MAX_FILE_BYTES);
+			const allLines = raw.split("\n");
+			const truncated = raw.length >= MAX_FILE_BYTES || allLines.length > maxLines;
+			const content = buildHeadPreviewContent(raw, maxLines, truncated);
+			return {
+				id: "",
+				kind: "file",
+				title: relPath,
+				content,
+				fingerprint: hashText(content),
+				path: relPath,
+				language: languageFromPath(relPath),
+				extractionWarning: extracted.warning,
+			};
+		}
+
 		const size = statSync(absPath).size;
 		let raw = readFileSync(absPath, "utf8");
 		if (!isProbablyText(raw)) return undefined;
 		const wasTruncatedByBytes = raw.length > MAX_FILE_BYTES;
 		if (wasTruncatedByBytes) raw = raw.slice(0, MAX_FILE_BYTES);
-		const relPath = displayPath(relative(repoRoot, absPath));
-		const ext = extname(relPath).toLowerCase();
 		const allLines = raw.split("\n");
 		const truncated = wasTruncatedByBytes || allLines.length > maxLines || size > MAX_FILE_BYTES;
 		const content = CODE_FILE_EXTENSIONS.has(ext)
@@ -958,40 +1102,142 @@ function isLikelyCodeFile(path: string): boolean {
 	return CODE_FILE_EXTENSIONS.has(extname(path).toLowerCase());
 }
 
-function representativeRepoFiles(repoRoot: string, recentFiles: string[], limit = MAX_TRACKED_FILES): string[] {
+function isLikelyDocumentFile(path: string): boolean {
+	return DOCUMENT_FILE_EXTENSIONS.has(extname(path).toLowerCase());
+}
+
+function isExternalExtractionFile(path: string): boolean {
+	const ext = extname(path).toLowerCase();
+	return ext === ".pdf" || ext === ".docx";
+}
+
+function focusKeywords(focus?: string): string[] {
+	if (!focus) return [];
+	const stopwords = new Set([
+		"the",
+		"and",
+		"for",
+		"that",
+		"with",
+		"from",
+		"this",
+		"these",
+		"those",
+		"into",
+		"about",
+		"common",
+		"themes",
+		"how",
+		"what",
+		"why",
+		"where",
+		"when",
+		"look",
+		"at",
+		"across",
+		"through",
+		"their",
+		"they",
+		"them",
+	]);
+	return Array.from(
+		new Set(
+			focus
+				.toLowerCase()
+				.split(/[^a-z0-9]+/)
+				.map((part) => part.trim())
+				.filter((part) => part.length >= 3 && !stopwords.has(part)),
+		),
+	);
+}
+
+function focusPathScore(path: string, focus?: string): number {
+	const keywords = focusKeywords(focus);
+	if (keywords.length === 0) return 0;
+	const lower = path.toLowerCase();
+	let score = 0;
+	for (const keyword of keywords) {
+		if (lower.includes(keyword)) score += 6;
+	}
+	return score;
+}
+
+function repoFileHeuristicScore(file: string, audience?: QuizAudience, focus?: string): number {
+	const lower = file.toLowerCase();
+	let score = focusPathScore(file, focus);
+
+	if (isLikelyCodeFile(file)) {
+		if (lower.startsWith("src/")) score += 10;
+		if (lower.startsWith("lib/")) score += 8;
+		if (lower.startsWith("app/")) score += 8;
+		if (lower.includes("index")) score += 2;
+		if (lower.includes("main")) score += 2;
+		if (lower.includes("core")) score += 2;
+		if (lower.includes("test") || lower.includes("spec")) score -= 10;
+		if (audience === "reviewer") score -= 4;
+	}
+
+	if (isLikelyDocumentFile(file)) {
+		score += audience === "reviewer" ? 12 : 4;
+		if (lower.startsWith("docs/")) score += 6;
+		if (lower.startsWith("papers/")) score += 6;
+		if (lower.startsWith("paper/")) score += 5;
+		if (lower.startsWith("thesis/")) score += 6;
+		if (lower.startsWith("chapters/")) score += 5;
+		if (lower.includes("abstract")) score += 4;
+		if (lower.includes("introduction") || lower.includes("intro")) score += 3;
+		if (lower.includes("method")) score += 2;
+		if (lower.includes("appendix")) score -= 2;
+	}
+
+	return score;
+}
+
+function representativeRepoFiles(
+	repoRoot: string,
+	recentFiles: string[],
+	limit = MAX_TRACKED_FILES,
+	focus?: string,
+	audience?: QuizAudience,
+): string[] {
 	const resolvedRecent = recentFiles
 		.filter((file) => file.startsWith(repoRoot))
 		.map((file) => displayPath(relative(repoRoot, file)))
-		.filter(isLikelyCodeFile);
-	if (resolvedRecent.length > 0) return resolvedRecent.slice(0, limit);
+		.filter((file) => isLikelyCodeFile(file) || isLikelyDocumentFile(file));
+	if (resolvedRecent.length > 0) {
+		return resolvedRecent
+			.sort(
+				(a, b) =>
+					repoFileHeuristicScore(b, audience, focus) - repoFileHeuristicScore(a, audience, focus) ||
+					a.length - b.length ||
+					a.localeCompare(b),
+			)
+			.slice(0, limit);
+	}
 
-	const tracked = listTrackedFiles(repoRoot).filter(isLikelyCodeFile);
+	const tracked = listTrackedFiles(repoRoot).filter((file) => isLikelyCodeFile(file) || isLikelyDocumentFile(file));
 	const scored = tracked
-		.map((file) => {
-			let score = 0;
-			if (file.startsWith("src/")) score += 10;
-			if (file.startsWith("lib/")) score += 8;
-			if (file.startsWith("app/")) score += 8;
-			if (file.includes("index")) score += 2;
-			if (file.includes("main")) score += 2;
-			if (file.includes("core")) score += 2;
-			if (file.includes("test") || file.includes("spec")) score -= 10;
-			return { file, score };
-		})
+		.map((file) => ({ file, score: repoFileHeuristicScore(file, audience, focus) }))
 		.sort((a, b) => b.score - a.score || a.file.length - b.file.length || a.file.localeCompare(b.file));
 	return scored.slice(0, limit).map((item) => item.file);
 }
 
-function selectRepoFiles(repoRoot: string, activity: FileActivity[], limit = MAX_TRACKED_FILES + 1): string[] {
+function selectRepoFiles(
+	repoRoot: string,
+	activity: FileActivity[],
+	limit = MAX_TRACKED_FILES + 1,
+	focus?: string,
+	audience?: QuizAudience,
+): string[] {
 	const selected: string[] = [];
-	pushUniquePath(selected, findRootManifest(repoRoot), limit);
+	if (audience !== "reviewer") pushUniquePath(selected, findRootManifest(repoRoot), limit);
 	for (const item of activity) {
-		if (!isLikelyCodeFile(item.relPath)) continue;
+		if (!isLikelyCodeFile(item.relPath) && !isLikelyDocumentFile(item.relPath)) continue;
 		pushUniquePath(selected, item.absPath, limit);
 		if (selected.length >= limit) break;
 	}
 	if (selected.length < limit) {
-		for (const relPath of representativeRepoFiles(repoRoot, activity.map((item) => item.absPath), limit * 2)) {
+		for (const relPath of representativeRepoFiles(repoRoot, activity.map((item) => item.absPath), limit * 2, focus, audience)) {
 			pushUniquePath(selected, join(repoRoot, relPath), limit);
 			if (selected.length >= limit) break;
 		}
@@ -1003,11 +1249,19 @@ function addSource(sources: SourceItem[], source: Omit<SourceItem, "id">): void 
 	sources.push({ ...source, id: `s${sources.length + 1}` });
 }
 
-function gatherSources(scope: ResolvedScope, ctx: ExtensionCommandContext, cwd: string, repoRoot: string): SourceItem[] {
+function gatherSources(
+	scope: ResolvedScope,
+	ctx: ExtensionCommandContext,
+	cwd: string,
+	repoRoot: string,
+	options: GatherSourcesOptions = {},
+): SourceItem[] {
 	const branch = ctx.sessionManager.getBranch() as SessionBranchEntry[];
 	const recentConversation = buildRecentConversationText(branch);
 	const fileActivity = collectFileActivity(branch, cwd, repoRoot);
 	const sources: SourceItem[] = [];
+	const broaden = Boolean(options.broaden);
+	const fileLimit = broaden ? MAX_FOCUS_CANDIDATE_FILES : MAX_TRACKED_FILES;
 
 	if (recentConversation) {
 		addSource(sources, {
@@ -1026,7 +1280,8 @@ function gatherSources(scope: ResolvedScope, ctx: ExtensionCommandContext, cwd: 
 	}
 
 	if (scope.kind === "workset" || scope.kind === "session") {
-		const selectedFiles = scope.kind === "workset" ? selectWorksetFiles(repoRoot, fileActivity) : selectSessionFiles(fileActivity);
+		const selectedFiles =
+			scope.kind === "workset" ? selectWorksetFiles(repoRoot, fileActivity, fileLimit) : selectSessionFiles(fileActivity, fileLimit);
 		for (const file of selectedFiles) {
 			const source = filePreview(file, repoRoot);
 			if (source) addSource(sources, source);
@@ -1052,7 +1307,13 @@ function gatherSources(scope: ResolvedScope, ctx: ExtensionCommandContext, cwd: 
 			});
 		}
 
-		for (const file of selectRepoFiles(repoRoot, fileActivity)) {
+		for (const file of selectRepoFiles(
+			repoRoot,
+			fileActivity,
+			broaden ? MAX_FOCUS_CANDIDATE_FILES + 1 : MAX_TRACKED_FILES + 1,
+			options.focus,
+			options.audience,
+		)) {
 			const source = filePreview(file, repoRoot);
 			if (source) addSource(sources, source);
 		}
@@ -1075,6 +1336,8 @@ function audienceLabel(audience: QuizAudience): string {
 			return "scientist";
 		case "developer":
 			return "developer";
+		case "reviewer":
+			return "reviewer";
 		default:
 			return "general";
 	}
@@ -1095,11 +1358,20 @@ function audiencePromptGuidance(audience: QuizAudience): string[] {
 				"Bias toward interfaces, control flow, contracts, invariants, extension points, edge cases, and likely debugging or refactoring consequences.",
 				"Direct wording still matters, but moderate software-engineering language is acceptable.",
 			];
+		case "reviewer":
+			return [
+				"Audience profile: academic reviewer / critical reader.",
+				"The source material is an academic document (paper, thesis, report), not source code.",
+				"Bias toward claims and their support, methodology and its justification, assumptions (stated and unstated), evidence quality, logical structure of the argument, and implications or limitations.",
+				"Prefer questions that force the reader to articulate what the authors actually claimed vs. what they showed, what assumptions underpin a result, what would change if an assumption were relaxed, or where the argument is weakest.",
+				"Snippets should quote key passages, definitions, equations, or result statements from the document.",
+				"Do not ask about formatting, citation style, or editorial minutiae unless it affects the substance of the argument.",
+			];
 		default:
 			return [
 				"Audience profile: general.",
 				"Blend conceptual meaning with code mechanics. Keep wording accessible. Do not assume deep domain expertise or advanced software jargon.",
-				"Prefer straightforward, operational questions that a broadly technical user can answer from the code.",
+				"Prefer straightforward, operational questions that a broadly technical user can answer from the material.",
 			];
 	}
 }
@@ -1108,6 +1380,8 @@ function parseQuizCommandArgs(args: string, cwd: string, repoRoot: string): Pars
 	let remaining = args.trim();
 	let thinkingLevel: QuizRequestedThinkingLevel | undefined;
 	let audience = DEFAULT_QUIZ_AUDIENCE;
+	let focus: string | undefined;
+	let fileScope: ResolvedScope | undefined;
 
 	const explicitMatch = /(?:^|\s)--thinking\s+(off|minimal|low|medium|high)(?=\s|$)/i.exec(remaining);
 	if (explicitMatch) {
@@ -1138,7 +1412,7 @@ function parseQuizCommandArgs(args: string, cwd: string, repoRoot: string): Pars
 		if (!normalized) {
 			return {
 				audience,
-				error: `Invalid audience: ${explicitAudience[1]}. Use one of: general (gen), scientist (sci), developer (dev)\n\nUsage:\n${USAGE}`,
+				error: `Invalid audience: ${explicitAudience[1]}. Use one of: general (gen), scientist (sci), developer (dev), reviewer (rev)\n\nUsage:\n${USAGE}`,
 			};
 		}
 		audience = normalized;
@@ -1149,13 +1423,83 @@ function parseQuizCommandArgs(args: string, cwd: string, repoRoot: string): Pars
 			const attempted = malformedAudience[1] || "<missing>";
 			return {
 				audience,
-				error: `Invalid audience: ${attempted}. Use one of: general (gen), scientist (sci), developer (dev)\n\nUsage:\n${USAGE}`,
+				error: `Invalid audience: ${attempted}. Use one of: general (gen), scientist (sci), developer (dev), reviewer (rev)\n\nUsage:\n${USAGE}`,
 			};
 		}
 	}
 
+	const focusQuoted = /(?:^|\s)--focus\s+"([^"]*?)"(?=\s|$)/i.exec(remaining);
+	if (focusQuoted) {
+		focus = focusQuoted[1]!.trim() || undefined;
+		remaining = `${remaining.slice(0, focusQuoted.index)} ${remaining.slice(focusQuoted.index + focusQuoted[0].length)}`.trim();
+	} else {
+		const focusUnquoted = /(?:^|\s)--focus\s+(\S+)(?=\s|$)/i.exec(remaining);
+		if (focusUnquoted) {
+			focus = focusUnquoted[1]!.trim() || undefined;
+			remaining = `${remaining.slice(0, focusUnquoted.index)} ${remaining.slice(focusUnquoted.index + focusUnquoted[0].length)}`.trim();
+		}
+	}
+
+	const fileQuoted = /(?:^|\s)--file\s+"([^"]*?)"(?=\s|$)/i.exec(remaining);
+	if (fileQuoted) {
+		const parsedFile = resolveQuizFileScope(fileQuoted[1]!, cwd, repoRoot);
+		if (!parsedFile.scope) {
+			return { audience, focus, thinkingLevel, error: parsedFile.error };
+		}
+		fileScope = parsedFile.scope;
+		remaining = `${remaining.slice(0, fileQuoted.index)} ${remaining.slice(fileQuoted.index + fileQuoted[0].length)}`.trim();
+	} else {
+		const fileUnquoted = /(?:^|\s)--file\s+(\S+)(?=\s|$)/i.exec(remaining);
+		if (fileUnquoted) {
+			const parsedFile = resolveQuizFileScope(fileUnquoted[1]!, cwd, repoRoot);
+			if (!parsedFile.scope) {
+				return { audience, focus, thinkingLevel, error: parsedFile.error };
+			}
+			fileScope = parsedFile.scope;
+			remaining = `${remaining.slice(0, fileUnquoted.index)} ${remaining.slice(fileUnquoted.index + fileUnquoted[0].length)}`.trim();
+		} else {
+			const malformedFile = /(?:^|\s)--file(?:\s+(\S+))?/i.exec(remaining);
+			if (malformedFile) {
+				const attempted = malformedFile[1] || "<missing>";
+				return {
+					audience,
+					focus,
+					thinkingLevel,
+					error: `Invalid file path: ${attempted}. Use /quiz --file <path> or /quiz file <path>\n\nUsage:\n${USAGE}`,
+				};
+			}
+		}
+	}
+
+	if (fileScope) {
+		if (remaining.trim().length > 0) {
+			return {
+				audience,
+				focus,
+				thinkingLevel,
+				error: `Use either --file <path> or a positional quiz scope, not both.\n\nUsage:\n${USAGE}`,
+			};
+		}
+		return { scope: fileScope, thinkingLevel, audience, focus };
+	}
+
 	const parsedScope = parseScopeArgs(remaining, cwd, repoRoot);
-	return { ...parsedScope, thinkingLevel, audience };
+	return { ...parsedScope, thinkingLevel, audience, focus };
+}
+
+function resolveQuizFileScope(pathArg: string, cwd: string, repoRoot: string): { scope?: ResolvedScope; error?: string } {
+	const trimmed = pathArg.trim();
+	if (!trimmed) return { error: `Missing file path.\n\nUsage:\n${USAGE}` };
+	const absPath = resolve(cwd, trimmed);
+	if (!existsSync(absPath) || !statSync(absPath).isFile()) return { error: `File not found: ${trimmed}` };
+	return {
+		scope: {
+			kind: "file",
+			label: `File: ${displayPath(relative(repoRoot, absPath))}`,
+			path: displayPath(relative(repoRoot, absPath)),
+			absPath,
+		},
+	};
 }
 
 function parseScopeArgs(args: string, cwd: string, repoRoot: string): { scope?: ResolvedScope; error?: string } {
@@ -1167,19 +1511,7 @@ function parseScopeArgs(args: string, cwd: string, repoRoot: string): { scope?: 
 	if (head === "workset") return { scope: { kind: "workset", label: "Current workset" } };
 	if (head === "session") return { scope: { kind: "session", label: "Current session" } };
 	if (head === "repo" || head === "codebase") return { scope: { kind: "repo", label: "Repository" } };
-	if (head === "file") {
-		if (!tail) return { error: `Missing file path.\n\nUsage:\n${USAGE}` };
-		const absPath = resolve(cwd, tail);
-		if (!existsSync(absPath) || !statSync(absPath).isFile()) return { error: `File not found: ${tail}` };
-		return {
-			scope: {
-				kind: "file",
-				label: `File: ${displayPath(relative(repoRoot, absPath))}`,
-				path: displayPath(relative(repoRoot, absPath)),
-				absPath,
-			},
-		};
-	}
+	if (head === "file") return resolveQuizFileScope(tail, cwd, repoRoot);
 
 	const maybePath = resolve(cwd, trimmed);
 	if (existsSync(maybePath) && statSync(maybePath).isFile()) {
@@ -1201,6 +1533,7 @@ function buildQuizPrompt(
 	sources: SourceItem[],
 	audience: QuizAudience,
 	previousCards: QuizCard[] = [],
+	focus?: string,
 ): string {
 	const sourceText = sources
 		.map((source) => {
@@ -1217,8 +1550,12 @@ function buildQuizPrompt(
 		.join("\n\n");
 
 	const scopeGuidance =
-		audience === "scientist"
-			? scope.kind === "repo"
+		audience === "reviewer"
+			? scope.kind === "file"
+				? "This is an academic document. Bias toward the claims made, the methodology and its justification, key assumptions, the evidence presented, and the logical structure of the argument."
+				: "Bias toward the main claims, methods, assumptions, and argument structure across the provided academic material."
+			: audience === "scientist"
+				? scope.kind === "repo"
 				? "Bias toward the repo's main modelling pieces, what quantities or states they represent, how values move through them, and which files carry the main conceptual load."
 				: scope.kind === "file"
 					? "Bias toward what this file represents, what quantities or structures it manipulates, how values are transformed, and what assumptions matter for the model."
@@ -1243,6 +1580,7 @@ function buildQuizPrompt(
 		"",
 		scopeGuidance,
 		...audiencePromptGuidance(audience),
+		focus ? `\nUser focus: concentrate questions on ${focus}. Prioritize source material related to this focus.` : undefined,
 		"",
 		`Create ${CARD_COUNT} quiz cards.`,
 		"Default stance: the user is still orienting to the code and needs a gentle ramp, not an oral exam or a trap-heavy critique.",
@@ -1317,6 +1655,127 @@ function buildQuizPrompt(
 	]
 		.filter(Boolean)
 		.join("\n");
+}
+
+function buildSourceSelectionPrompt(
+	scope: ResolvedScope,
+	candidates: SourceItem[],
+	audience: QuizAudience,
+	focus: string,
+): string {
+	const renderedCandidates = candidates
+		.map((source) => {
+			const preview = trimText(stripLineNumberPrefixes(source.content), SOURCE_SELECTION_PREVIEW_CHARS);
+			const meta = [
+				`id=${source.id}`,
+				`kind=${source.kind}`,
+				`title=${JSON.stringify(source.title)}`,
+				source.path ? `path=${JSON.stringify(source.path)}` : undefined,
+			]
+				.filter(Boolean)
+				.join(" | ");
+			return [`=== CANDIDATE ${meta} ===`, preview, `=== END CANDIDATE ${source.id} ===`].join("\n");
+		})
+		.join("\n\n");
+
+	return [
+		`Scope: ${scope.kind}`,
+		`Scope label: ${scope.label}`,
+		`Audience: ${audienceLabel(audience)}`,
+		`User focus: ${focus}`,
+		`Choose up to ${MAX_FOCUS_SELECTED_SOURCES} source ids. Prefer a compact, complementary set that will support a strong focused quiz.`,
+		"If the focus asks for comparison or common themes, selecting multiple documents/files is appropriate.",
+		"Prefer concrete sources with real evidence or mechanisms over generic metadata, unless repo structure itself is central.",
+		"Return JSON of the form:",
+		JSON.stringify({ selectedIds: ["s2", "s5"], rationale: "brief reason" }, null, 2),
+		"",
+		"Candidate sources:",
+		renderedCandidates,
+	].join("\n\n");
+}
+
+function fallbackFocusedSources(candidates: SourceItem[]): SourceItem[] {
+	const nonConversation = candidates.filter((source) => source.kind !== "conversation");
+	return (nonConversation.length > 0 ? nonConversation : candidates).slice(0, MAX_FOCUS_SELECTED_SOURCES);
+}
+
+async function selectFocusedSources(
+	ctx: ExtensionCommandContext,
+	scope: ResolvedScope,
+	candidates: SourceItem[],
+	audience: QuizAudience,
+	focus: string,
+	signal: AbortSignal,
+): Promise<SourceItem[]> {
+	if (!ctx.model || candidates.length <= MAX_FOCUS_SELECTED_SOURCES) return candidates;
+	const auth = await resolveQuizModelRequestAuth(ctx, ctx.model);
+	const prompt = buildSourceSelectionPrompt(scope, candidates, audience, focus);
+	let useJsonSchema = shouldUseResponsesJsonSchema(ctx.model);
+	const runSelection = async (reasoning: ThinkingLevel | undefined, enableSchema: boolean) =>
+		completeSimple(
+			ctx.model!,
+			{
+				systemPrompt: SOURCE_SELECTION_SYSTEM_PROMPT,
+				messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }],
+			},
+			{
+				apiKey: auth.apiKey,
+				headers: auth.headers,
+				reasoning,
+				maxTokens: 1200,
+				signal,
+				onPayload: enableSchema
+					? async (payload) =>
+						withResponsesJsonSchemaFormat(
+							payload,
+							"quiz_source_selection",
+							SOURCE_SELECTION_JSON_SCHEMA as unknown as Record<string, unknown>,
+							"Selected local sources for a focused quiz.",
+						)
+					: undefined,
+			},
+		);
+
+	let response = await runSelection(ctx.model.reasoning ? "minimal" : undefined, useJsonSchema);
+	let responsePartTypes = response.content
+		.map((part) => (typeof part?.type === "string" ? part.type : "unknown"))
+		.filter((type, index, array) => array.indexOf(type) === index);
+	let responseText = response.content
+		.filter((part): part is { type: "text"; text: string } => part.type === "text")
+		.map((part) => part.text)
+		.join("\n");
+	if (useJsonSchema && isInvalidResponsesJsonSchemaError(response.errorMessage)) {
+		useJsonSchema = false;
+		response = await runSelection(ctx.model.reasoning ? "minimal" : undefined, false);
+		responsePartTypes = response.content
+			.map((part) => (typeof part?.type === "string" ? part.type : "unknown"))
+			.filter((type, index, array) => array.indexOf(type) === index);
+		responseText = response.content
+			.filter((part): part is { type: "text"; text: string } => part.type === "text")
+			.map((part) => part.text)
+			.join("\n");
+	}
+	if (isThinkingOnlyResponse(responseText, responsePartTypes)) {
+		response = await runSelection(undefined, useJsonSchema);
+		responseText = response.content
+			.filter((part): part is { type: "text"; text: string } => part.type === "text")
+			.map((part) => part.text)
+			.join("\n");
+	}
+
+	try {
+		const { data } = parseJsonPayloadText(responseText, "source-selection");
+		const selectedIds = Array.isArray((data as { selectedIds?: unknown }).selectedIds)
+			? ((data as { selectedIds?: unknown }).selectedIds as unknown[]).filter((value): value is string => typeof value === "string")
+			: [];
+		const chosen = selectedIds
+			.map((id) => candidates.find((source) => source.id === id))
+			.filter((source): source is SourceItem => source !== undefined)
+			.slice(0, MAX_FOCUS_SELECTED_SOURCES);
+		return chosen.length > 0 ? chosen : fallbackFocusedSources(candidates);
+	} catch {
+		return fallbackFocusedSources(candidates);
+	}
 }
 
 function extractJsonPayload(text: string): string {
@@ -1559,10 +2018,11 @@ async function generateQuizPacket(
 	signal: AbortSignal,
 	thinkingOverride?: QuizRequestedThinkingLevel,
 	previousCards: QuizCard[] = [],
+	focus?: string,
 ): Promise<QuizPacket> {
 	if (!ctx.model) throw new Error("No active model selected");
 	const auth = await resolveQuizModelRequestAuth(ctx, ctx.model);
-	const basePrompt = buildQuizPrompt(scope, sources, audience, previousCards);
+	const basePrompt = buildQuizPrompt(scope, sources, audience, previousCards, focus);
 	const effectiveThinkingLevel = resolveQuizThinkingLevel(pi, thinkingOverride);
 	const reasoning = ctx.model.reasoning ? toReasoning(effectiveThinkingLevel) : undefined;
 	let lastError: Error | undefined;
@@ -1604,7 +2064,7 @@ async function generateQuizPacket(
 							payload,
 							"code_quiz_packet",
 							QUIZ_PACKET_JSON_SCHEMA as unknown as Record<string, unknown>,
-							"A packet of active code-understanding quiz cards.",
+							"A packet of active understanding quiz cards.",
 						)
 					: undefined,
 			},
@@ -1673,7 +2133,7 @@ async function generateQuizPacket(
 	throw lastError || new Error("Quiz generation failed");
 }
 
-const ANSWER_FEEDBACK_SYSTEM_PROMPT = `You are a concise, supportive code tutor.
+const ANSWER_FEEDBACK_SYSTEM_PROMPT = `You are a concise, supportive tutor.
 
 Given a quiz question, an ideal answer, and the user's answer, evaluate the user's answer briefly and constructively.
 
@@ -1769,7 +2229,7 @@ async function evaluateQuizAnswer(
 						payload,
 						"code_quiz_answer_feedback",
 						ANSWER_FEEDBACK_JSON_SCHEMA as unknown as Record<string, unknown>,
-						"Brief structured feedback on a user's answer to a code quiz question.",
+						"Brief structured feedback on a user's answer to a quiz question.",
 					)
 				: undefined,
 		},
@@ -1828,7 +2288,7 @@ async function evaluateQuizAnswer(
 							payload,
 							"code_quiz_answer_feedback",
 							ANSWER_FEEDBACK_JSON_SCHEMA as unknown as Record<string, unknown>,
-							"Brief structured feedback on a user's answer to a code quiz question.",
+							"Brief structured feedback on a user's answer to a quiz question.",
 						)
 					: undefined,
 			},
@@ -1849,7 +2309,149 @@ async function evaluateQuizAnswer(
 	return normalizeAnswerFeedback(data);
 }
 
-const DISCUSSION_SYSTEM_PROMPT = `You are continuing a code-understanding discussion for a single quiz card.
+function computeCompletionStats(answers: QuizRunAnswer[], questionSetsCompleted: number): QuizCompletionStats {
+	return {
+		answered: answers.filter((entry) => !entry.skipped).length,
+		skipped: answers.filter((entry) => entry.skipped).length,
+		questionSetsCompleted,
+		good: answers.filter((entry) => entry.feedback?.assessment === "good").length,
+		partial: answers.filter((entry) => entry.feedback?.assessment === "partial").length,
+		miss: answers.filter((entry) => entry.feedback?.assessment === "miss").length,
+	};
+}
+
+const QUIZ_WRAP_UP_SYSTEM_PROMPT = `You are writing a short wrap-up report after an active quiz.
+
+Requirements:
+- Be concise, supportive, and action-oriented.
+- Focus on consolidation, not passive summary.
+- Return markdown only.
+- Use exactly these section headings: \`### Seems solid\`, \`### Revisit\`, \`### Next focus\`.
+- Under each heading, prefer 1-3 short bullet points.
+- Respect the intended audience profile.
+- If a user focus was provided, stay anchored to it.
+- Do not restate every question verbatim.
+`;
+
+async function generateQuizWrapUp(
+	ctx: ExtensionCommandContext,
+	packet: QuizPacket,
+	answers: QuizRunAnswer[],
+	audience: QuizAudience,
+	completionStats: QuizCompletionStats,
+	focus?: string,
+	thinkingOverride?: QuizRequestedThinkingLevel,
+	signal?: AbortSignal,
+): Promise<string> {
+	const answeredEntries = answers.filter((entry) => !entry.skipped);
+	if (answeredEntries.length === 0) {
+		return "No answered questions yet — there is not much evidence for a meaningful wrap-up. Try answering at least one card next round.";
+	}
+	if (!ctx.model) throw new Error("No active model selected");
+	const auth = await resolveQuizModelRequestAuth(ctx, ctx.model);
+	const reasoning = ctx.model.reasoning ? toReasoning(thinkingOverride ?? "off") : undefined;
+	const cardMap = new Map(packet.cards.map((card) => [card.id, card]));
+	const answerSummary = answeredEntries
+		.slice(-12)
+		.map((entry, index) => {
+			const card = cardMap.get(entry.cardId);
+			return [
+				`${index + 1}. Question: ${card?.question || entry.cardId}`,
+				`Assessment: ${entry.feedback?.assessment || "unassessed"}`,
+				entry.answer ? `User answer: ${trimText(entry.answer, 500)}` : undefined,
+				entry.feedback?.feedback ? `Feedback: ${trimText(entry.feedback.feedback, 320)}` : undefined,
+				entry.feedback?.missed?.length ? `Missed: ${entry.feedback.missed.join("; ")}` : undefined,
+				entry.feedback?.gotRight?.length ? `Got right: ${entry.feedback.gotRight.join("; ")}` : undefined,
+				card?.idealAnswer ? `Ideal answer: ${trimText(card.idealAnswer, 360)}` : undefined,
+			]
+				.filter(Boolean)
+				.join("\n");
+		})
+		.join("\n\n");
+	const prompt = [
+		`Scope: ${packet.scope.label}`,
+		`Quiz summary: ${packet.sourceSummary}`,
+		`Audience: ${audienceLabel(audience)}`,
+		focus ? `User focus: ${focus}` : undefined,
+		`Completion stats: answered ${completionStats.answered}, skipped ${completionStats.skipped}, good ${completionStats.good}, partial ${completionStats.partial}, miss ${completionStats.miss}.`,
+		"Per-question outcomes:",
+		answerSummary,
+		"Write a short wrap-up report in markdown using the exact headings: ### Seems solid, ### Revisit, ### Next focus.",
+	]
+		.filter(Boolean)
+		.join("\n\n");
+
+	const runWrapUp = async (reasoningLevel: ThinkingLevel | undefined) =>
+		completeSimple(
+			ctx.model!,
+			{
+				systemPrompt: QUIZ_WRAP_UP_SYSTEM_PROMPT,
+				messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }],
+			},
+			{
+				apiKey: auth.apiKey,
+				headers: auth.headers,
+				reasoning: reasoningLevel,
+				maxTokens: 800,
+				signal,
+			},
+		);
+
+	let response = await runWrapUp(reasoning);
+	let responsePartTypes = response.content
+		.map((part) => (typeof part?.type === "string" ? part.type : "unknown"))
+		.filter((type, index, array) => array.indexOf(type) === index);
+	let responseText = response.content
+		.filter((part): part is { type: "text"; text: string } => part.type === "text")
+		.map((part) => part.text)
+		.join("\n")
+		.trim();
+	if (isThinkingOnlyResponse(responseText, responsePartTypes) && reasoning !== undefined) {
+		response = await runWrapUp(undefined);
+		responseText = response.content
+			.filter((part): part is { type: "text"; text: string } => part.type === "text")
+			.map((part) => part.text)
+			.join("\n")
+			.trim();
+	}
+	return (
+		safeString(responseText) ||
+		"### Seems solid\n- You engaged with the material and surfaced real distinctions.\n\n### Revisit\n- Tighten the places where your answers were partial or missed key assumptions.\n\n### Next focus\n- Pick one narrow mechanism, claim, or section and quiz it again."
+	);
+}
+
+function saveQuizWrapUpReport(
+	repoRoot: string,
+	packet: QuizPacket,
+	audience: QuizAudience,
+	completionStats: QuizCompletionStats,
+	wrapUpText: string,
+	focus?: string,
+): string {
+	const outputDir = join(repoRoot, "quiz-feedback");
+	mkdirSync(outputDir, { recursive: true });
+	const slug = slugify(focus || packet.scope.path || packet.scope.label || packet.sourceSummary || "quiz");
+	const filename = `wrapup_report_${timestampForFilename()}_${slug}.md`;
+	const outputPath = join(outputDir, filename);
+	const content = [
+		"# Wrap-up report",
+		"",
+		`- Generated: ${new Date().toISOString()}`,
+		`- Scope: ${packet.scope.label}`,
+		`- Audience: ${audienceLabel(audience)}`,
+		focus ? `- Focus: ${focus}` : undefined,
+		`- Quiz summary: ${packet.sourceSummary}`,
+		`- Stats: answered ${completionStats.answered}, skipped ${completionStats.skipped}, good ${completionStats.good}, partial ${completionStats.partial}, miss ${completionStats.miss}`,
+		"",
+		wrapUpText.trim(),
+	]
+		.filter(Boolean)
+		.join("\n");
+	writeFileSync(outputPath, content, "utf8");
+	return outputPath;
+}
+
+const DISCUSSION_SYSTEM_PROMPT = `You are continuing an understanding discussion for a single quiz card.
 
 Requirements:
 - Stay anchored to the current question, evidence snippet, answer feedback, and ideal answer.
@@ -1990,14 +2592,23 @@ function renderFeedbackList(title: string, items?: string[]): string {
 	return `
 		<div class="feedback-block">
 		  <div class="feedback-title">${escapeHtml(title)}</div>
-		  <ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
+		  <ul>${items.map((item) => `<li class="markdown-body">${renderMarkdownHtml(item)}</li>`).join("")}</ul>
 		</div>
 	`;
 }
 
-function renderRichText(text?: string, fallback = ""): string {
+function renderMarkdownHtml(text?: string, fallback = ""): string {
 	const value = safeString(text) || fallback;
-	return escapeHtml(value).replace(/\n/g, "<br>");
+	if (!value) return "";
+	try {
+		return proseMarkdownRenderer.render(value);
+	} catch {
+		return `<p>${escapeHtml(value).replace(/\n/g, "<br>")}</p>`;
+	}
+}
+
+function renderRichText(text?: string, fallback = ""): string {
+	return `<div class="markdown-body">${renderMarkdownHtml(text, fallback)}</div>`;
 }
 
 function discussionPlaceholder(audience: QuizAudience): string {
@@ -2006,6 +2617,8 @@ function discussionPlaceholder(audience: QuizAudience): string {
 			return "Ask for a more intuitive explanation, the meaning of the quantities, or what changes under a perturbation…";
 		case "developer":
 			return "Ask about control flow, contracts, edge cases, or refactor/debug consequences…";
+		case "reviewer":
+			return "Ask about the strength of the evidence, unstated assumptions, alternative interpretations, or what the argument depends on…";
 		default:
 			return "Ask for a more intuitive explanation, a concrete example, or what would change if something changed…";
 	}
@@ -2043,7 +2656,7 @@ function renderGlimpseLoadingHtml(scopeLabel: string, sourceSummary: string, mes
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Code Quiz</title>
+<title>Quiz</title>
 <style>
 :root {
   color-scheme: light dark;
@@ -2128,7 +2741,7 @@ button:hover { border-color: var(--accent); }
   <div class="window">
     <div class="header">
       <div>
-        <div class="title">Code Quiz</div>
+        <div class="title">Quiz</div>
         <div class="meta">Preparing questions</div>
       </div>
       <div class="meta">${escapeHtml(scopeLabel)}</div>
@@ -2203,13 +2816,44 @@ function renderGlimpseQuizHtml(
 		`
 		: "";
 	const completionStats = state.completionStats;
+	const completionWrapUp = state.wrapUpPending
+		? `
+			<div class="answer-card">
+			  <div class="section-label">Wrap-up report</div>
+			  <div class="loading-inline"><span class="mini-spinner"></span><span>Preparing a short wrap-up report…</span></div>
+			</div>
+		`
+		: state.wrapUpText
+			? `
+				<div class="answer-card">
+				  <div class="section-label">Wrap-up report</div>
+				  <div class="markdown-body">${renderMarkdownHtml(state.wrapUpText)}</div>
+				  ${state.wrapUpSavedPath ? `<div class="footer-note">Saved to ${escapeHtml(state.wrapUpSavedPath)}</div>` : ""}
+				</div>
+			`
+			: "";
+	const completionStatsGrid = completionStats
+		? `
+			<div class="stats-grid">
+			  <div class="stat-card"><div class="stat-label">Answered</div><div class="stat-value">${completionStats.answered}</div></div>
+			  <div class="stat-card"><div class="stat-label">Skipped</div><div class="stat-value">${completionStats.skipped}</div></div>
+			  <div class="stat-card"><div class="stat-label">Strong</div><div class="stat-value">${completionStats.good}</div></div>
+			  <div class="stat-card"><div class="stat-label">Partial</div><div class="stat-value">${completionStats.partial}</div></div>
+			  <div class="stat-card"><div class="stat-label">Miss</div><div class="stat-value">${completionStats.miss}</div></div>
+			  <div class="stat-card"><div class="stat-label">Sets</div><div class="stat-value">${completionStats.questionSetsCompleted}</div></div>
+			</div>
+		`
+		: "";
 	const completionSection = completionStats
 		? `
 			<div class="completion-card">
 			  <div class="section-label">Quiz complete</div>
 			  <div class="question completion-title">Finished this question set.</div>
-			  <div class="footer-note">Answered ${completionStats.answered} · skipped ${completionStats.skipped} · sets completed ${completionStats.questionSetsCompleted}</div>
+			  ${completionStatsGrid}
+			  ${completionWrapUp}
 			  <div class="actions">
+			    <button onclick="wrapUp()" ${state.wrapUpPending ? "disabled" : ""}>${state.wrapUpText ? "Refresh report" : "Wrap-up report"}</button>
+			    <button onclick="saveWrapUp()" ${(state.wrapUpPending || state.wrapUpSavePending || !state.wrapUpText) ? "disabled" : ""}>${state.wrapUpSavePending ? "Saving…" : "Save report"}</button>
 			    <button class="primary" onclick="moreQuestions()">More questions</button>
 			    <button class="ghost" onclick="closeQuiz()">Close</button>
 			  </div>
@@ -2240,7 +2884,7 @@ function renderGlimpseQuizHtml(
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Code Quiz</title>
+<title>Quiz</title>
 <style>
 :root {
   color-scheme: light dark;
@@ -2430,6 +3074,62 @@ button:disabled { opacity: 0.65; cursor: default; }
 .footer-note { font-size: 12px; color: var(--muted); }
 .completion-card { display: grid; gap: 12px; }
 .completion-title { font-size: 24px; }
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(108px, 1fr));
+  gap: 10px;
+}
+.stat-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px;
+  background: rgba(255,255,255,0.32);
+}
+@media (prefers-color-scheme: dark) {
+  .stat-card { background: rgba(255,255,255,0.02); }
+}
+.stat-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.stat-value {
+  font-size: 22px;
+  font-weight: 700;
+}
+.markdown-body { line-height: 1.45; }
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3 {
+  margin: 0 0 8px 0;
+  line-height: 1.3;
+}
+.markdown-body h1 { font-size: 20px; }
+.markdown-body h2 { font-size: 18px; }
+.markdown-body h3 { font-size: 16px; }
+.markdown-body p { margin: 0 0 10px 0; }
+.markdown-body p:last-child { margin-bottom: 0; }
+.markdown-body ul,
+.markdown-body ol { margin: 0 0 12px 20px; }
+.markdown-body li { margin: 4px 0; }
+.markdown-body a { color: var(--accent); }
+.markdown-body code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  padding: 1px 5px;
+  border-radius: 6px;
+}
+.markdown-body section { margin: 8px 0; }
+.markdown-body eq { display: inline; }
+.markdown-body eqn {
+  display: block;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 6px 0;
+}
+.markdown-body math { font-size: 1.02em; }
 .discussion-input { min-height: 110px; }
 .chat-thread {
   display: grid;
@@ -2496,7 +3196,7 @@ button:disabled { opacity: 0.65; cursor: default; }
   <div class="window">
     <div class="header">
       <div>
-        <div class="title">Code Quiz</div>
+        <div class="title">Quiz</div>
         <div class="meta">${escapeHtml(state.stage === "complete" ? "Set complete" : `Question ${index}/${packet.cards.length}`)}</div>
       </div>
       <div class="meta">${escapeHtml(packet.scope.label)}</div>
@@ -2517,7 +3217,7 @@ button:disabled { opacity: 0.65; cursor: default; }
         ${snippetSection}
         <div>
           <div class="section-label">Question</div>
-          <div class="question">${escapeHtml(card.question)}</div>
+          <div class="question markdown-body">${renderMarkdownHtml(card.question)}</div>
         </div>
         ${state.stage === "question" ? `
           <div>
@@ -2563,6 +3263,8 @@ button:disabled { opacity: 0.65; cursor: default; }
   function skipQuestion() { send({ type: 'skip' }); }
   function nextQuestion() { send({ type: 'next' }); }
   function moreQuestions() { send({ type: 'more-questions' }); }
+  function wrapUp() { send({ type: 'wrap-up' }); }
+  function saveWrapUp() { send({ type: 'save-wrap-up' }); }
   function openDiscussion() { send({ type: 'open-discussion', answer: currentAnswer(), discussion: currentDiscussion() }); }
   function hideDiscussion() { send({ type: 'hide-discussion', answer: currentAnswer(), discussion: currentDiscussion() }); }
   function sendFollowUp() { send({ type: 'send-follow-up', answer: currentAnswer(), discussion: currentDiscussion() }); }
@@ -2594,18 +3296,21 @@ async function runGlimpseQuizFlow(
 	repoRoot: string,
 	audience: QuizAudience,
 	thinkingOverride?: QuizRequestedThinkingLevel,
+	focus?: string,
 ): Promise<GlimpseQuizLaunchResult> {
 	const { open } = await loadGlimpseModule();
 	const effectiveThinkingLevel = resolveQuizThinkingLevel(pi, thinkingOverride);
 	const thinkingLabel = ctx.model?.reasoning ? ` · thinking ${effectiveThinkingLevel}` : "";
 	const audienceSuffix = audience === DEFAULT_QUIZ_AUDIENCE ? "" : ` · ${audienceLabel(audience)}`;
-	const loadingMessage = `Generating quiz with ${ctx.model?.id || "current model"}${thinkingLabel}${audienceSuffix}...`;
+	const focusSuffix = focus ? ` · focus ${focus}` : "";
+	const loadingMessage = `Generating quiz with ${ctx.model?.id || "current model"}${thinkingLabel}${audienceSuffix}${focusSuffix}...`;
 	const loadingSummary = defaultSourceSummary(scope, sources);
 
 	return await new Promise<GlimpseQuizLaunchResult>((resolve) => {
 		let finished = false;
 		let generationError: string | undefined;
 		let packet: QuizPacket | undefined;
+		let quizSources = sources;
 		const packets: QuizPacket[] = [];
 		const answers: QuizRunAnswer[] = [];
 		let index = 0;
@@ -2617,6 +3322,10 @@ async function runGlimpseQuizFlow(
 			discussionDraft: "",
 			discussionPending: false,
 			discussionMessages: [],
+			wrapUpText: "",
+			wrapUpPending: false,
+			wrapUpSavedPath: "",
+			wrapUpSavePending: false,
 		};
 		let currentRecord: QuizRunAnswer | null = null;
 		let currentPersisted = false;
@@ -2625,7 +3334,7 @@ async function runGlimpseQuizFlow(
 		const windowHandle = open(renderGlimpseLoadingHtml(scope.label, loadingSummary, loadingMessage), {
 			width: 920,
 			height: 860,
-			title: `Code Quiz · ${scope.label}`,
+			title: `Quiz · ${scope.label}`,
 			floating: true,
 			openLinks: true,
 		});
@@ -2670,6 +3379,10 @@ async function runGlimpseQuizFlow(
 				discussionPending: false,
 				discussionMessages: [],
 				completionStats: undefined,
+				wrapUpText: "",
+				wrapUpPending: false,
+				wrapUpSavedPath: "",
+				wrapUpSavePending: false,
 			};
 			currentRecord = null;
 			currentPersisted = false;
@@ -2677,17 +3390,17 @@ async function runGlimpseQuizFlow(
 		const showCompletionState = () => {
 			state = {
 				stage: "complete",
-				completionStats: {
-					answered: answers.filter((entry) => !entry.skipped).length,
-					skipped: answers.filter((entry) => entry.skipped).length,
-					questionSetsCompleted: packets.length,
-				},
+				completionStats: computeCompletionStats(answers, packets.length),
 				draftAnswer: "",
 				showHint: false,
 				discussionOpen: false,
 				discussionDraft: "",
 				discussionPending: false,
 				discussionMessages: [],
+				wrapUpText: "",
+				wrapUpPending: false,
+				wrapUpSavedPath: "",
+				wrapUpSavePending: false,
 			};
 			currentRecord = null;
 			currentPersisted = true;
@@ -2726,6 +3439,7 @@ async function runGlimpseQuizFlow(
 						answers,
 						packet: mergedPacket,
 						packets: packets.length > 1 ? packets.map((entry) => ({ ...entry })) : undefined,
+						wrapUp: safeString(state.wrapUpText),
 					},
 				});
 				return;
@@ -2882,7 +3596,7 @@ async function runGlimpseQuizFlow(
 							state.feedback,
 							audience,
 							thread,
-							sources,
+							quizSources,
 							repoRoot,
 							thinkingOverride,
 							requestAbort.signal,
@@ -2925,6 +3639,96 @@ async function runGlimpseQuizFlow(
 					}
 					return;
 				}
+				case "wrap-up": {
+					if (state.stage !== "complete" || !state.completionStats) return;
+					abortPendingRequest();
+					const completionStats = state.completionStats;
+					state = {
+						...state,
+						wrapUpPending: true,
+					};
+					rerender();
+					const requestAbort = new AbortController();
+					pendingRequestAbort = requestAbort;
+					try {
+						const mergedPacket = mergeQuizPackets(packets);
+						const wrapUp = await generateQuizWrapUp(
+							ctx,
+							mergedPacket,
+							answers,
+							audience,
+							completionStats,
+							focus,
+							thinkingOverride,
+							requestAbort.signal,
+						);
+						if (finished || requestAbort.signal.aborted) return;
+						state = {
+							...state,
+							wrapUpPending: false,
+							wrapUpText: wrapUp,
+							wrapUpSavedPath: "",
+							wrapUpSavePending: false,
+						};
+						rerender();
+					} catch (error) {
+						if (finished || requestAbort.signal.aborted) return;
+						state = {
+							...state,
+							wrapUpPending: false,
+							wrapUpText:
+								error instanceof Error
+									? `Could not generate a wrap-up report cleanly: ${error.message}`
+									: "Could not generate a wrap-up report cleanly.",
+							wrapUpSavedPath: "",
+							wrapUpSavePending: false,
+						};
+						rerender();
+					} finally {
+						if (pendingRequestAbort === requestAbort) pendingRequestAbort = null;
+					}
+					return;
+				}
+				case "save-wrap-up": {
+					if (state.stage !== "complete" || !state.completionStats || !safeString(state.wrapUpText)) return;
+					abortPendingRequest();
+					const completionStats = state.completionStats;
+					const wrapUpText = safeString(state.wrapUpText);
+					if (!wrapUpText) return;
+					state = {
+						...state,
+						wrapUpSavePending: true,
+					};
+					rerender();
+					try {
+						const mergedPacket = mergeQuizPackets(packets);
+						const savedAbsolutePath = saveQuizWrapUpReport(repoRoot, mergedPacket, audience, completionStats, wrapUpText, focus);
+						const savedDisplayPath = savedAbsolutePath.startsWith(repoRoot)
+							? displayPath(relative(repoRoot, savedAbsolutePath))
+							: displayPath(savedAbsolutePath);
+						if (finished) return;
+						state = {
+							...state,
+							wrapUpSavePending: false,
+							wrapUpSavedPath: savedDisplayPath,
+						};
+						rerender();
+						ctx.ui.notify(`Saved wrap-up report to ${savedDisplayPath}`, "info");
+					} catch (error) {
+						if (finished) return;
+						state = {
+							...state,
+							wrapUpSavePending: false,
+							wrapUpSavedPath: "",
+						};
+						rerender();
+						ctx.ui.notify(
+							error instanceof Error ? `Failed to save wrap-up report: ${error.message}` : "Failed to save wrap-up report",
+							"error",
+						);
+					}
+					return;
+				}
 				case "more-questions": {
 					if (state.stage !== "complete") return;
 					abortPendingRequest();
@@ -2936,6 +3740,10 @@ async function runGlimpseQuizFlow(
 						discussionOpen: false,
 						discussionPending: false,
 						completionStats: previousCompletionStats,
+						wrapUpPending: false,
+						wrapUpText: "",
+						wrapUpSavedPath: "",
+						wrapUpSavePending: false,
 					};
 					rerender();
 					const requestAbort = new AbortController();
@@ -2945,11 +3753,12 @@ async function runGlimpseQuizFlow(
 							pi,
 							ctx,
 							scope,
-							sources,
+							quizSources,
 							audience,
 							requestAbort.signal,
 							thinkingOverride,
 							previousCards,
+							focus,
 						);
 						if (finished || requestAbort.signal.aborted) return;
 						activatePacket(generatedPacket);
@@ -2990,7 +3799,12 @@ async function runGlimpseQuizFlow(
 			finish();
 		});
 
-		generateQuizPacket(pi, ctx, scope, sources, audience, generationAbort.signal, thinkingOverride)
+		(async () => {
+			if (focus && quizSources.length > MAX_FOCUS_SELECTED_SOURCES) {
+				quizSources = await selectFocusedSources(ctx, scope, quizSources, audience, focus, generationAbort.signal);
+			}
+			return generateQuizPacket(pi, ctx, scope, quizSources, audience, generationAbort.signal, thinkingOverride, [], focus);
+		})()
 			.then((generatedPacket) => {
 				if (finished) return;
 				activatePacket(generatedPacket);
@@ -3020,22 +3834,31 @@ async function handleGlimpseQuizCommand(
 
 	const cwd = process.cwd();
 	const repoRoot = getRepoRoot(cwd);
-	const { scope, thinkingLevel, audience, error } = parseQuizCommandArgs(args || "", cwd, repoRoot);
+	const { scope, thinkingLevel, audience, focus, error } = parseQuizCommandArgs(args || "", cwd, repoRoot);
 	if (!scope) {
 		ctx.ui.notify(error || "Failed to resolve quiz scope", "error");
 		return;
 	}
 
-	const sources = gatherSources(scope, ctx, cwd, repoRoot);
+	const sources = gatherSources(scope, ctx, cwd, repoRoot, {
+		broaden: Boolean(focus),
+		focus,
+		audience,
+	});
 	if (sources.length === 0) {
 		ctx.ui.notify(`No usable sources found for ${scope.label}`, "warning");
 		return;
 	}
 
+	const extractionWarnings = sources.map((s) => s.extractionWarning).filter(Boolean);
+	if (extractionWarnings.length > 0) {
+		ctx.ui.notify(extractionWarnings[0]!, "info");
+	}
+
 	if (activeQuizClose) activeQuizClose();
 
 	try {
-		const { packet, run, error: quizError } = await runGlimpseQuizFlow(pi, ctx, scope, sources, repoRoot, audience, thinkingLevel);
+		const { packet, run, error: quizError } = await runGlimpseQuizFlow(pi, ctx, scope, sources, repoRoot, audience, thinkingLevel, focus);
 		if (quizError) {
 			ctx.ui.notify(quizError, quizError === "Quiz generation cancelled" ? "info" : "error");
 			return;
@@ -3059,7 +3882,7 @@ async function handleGlimpseQuizCommand(
 
 export default function activeCodeTutor(pi: ExtensionAPI) {
 	pi.registerCommand("quiz", {
-		description: "Open an active code-understanding quiz in a native Glimpse window",
+		description: "Open an active understanding quiz in a native Glimpse window",
 		handler: async (args, ctx) => {
 			await handleGlimpseQuizCommand(pi, args || "", ctx);
 		},
@@ -3069,11 +3892,11 @@ export default function activeCodeTutor(pi: ExtensionAPI) {
 		description: "Close the active quiz window",
 		handler: async (_args, ctx) => {
 			if (!activeQuizClose) {
-				ctx.ui.notify("No code quiz is open", "info");
+				ctx.ui.notify("No quiz is open", "info");
 				return;
 			}
 			activeQuizClose();
-			ctx.ui.notify("Code quiz closed", "info");
+			ctx.ui.notify("Quiz closed", "info");
 		},
 	});
 }

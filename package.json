@@ -1,6 +1,6 @@
 {
   "name": "pi-quiz",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Active quiz for code and document understanding in pi",
   "type": "module",
   "license": "MIT",
@@ -57,6 +57,9 @@
   "dependencies": {
     "glimpseui": "^0.5.1",
     "highlight.js": "^11.11.1",
-    "jsonrepair": "^3.13.3"
+    "jsonrepair": "^3.13.3",
+    "katex": "^0.16.45",
+    "markdown-it": "^14.1.1",
+    "markdown-it-texmath": "^1.0.0"
   }
 }
